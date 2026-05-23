@@ -1,0 +1,92 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: taskqueue
+    ports:
+      - '5432:5432'
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - '3000:3000'
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/taskqueue
+      PORT: 3000
+      NODE_ENV: development
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_SERVICE_NAME: task-queue-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    deploy:
+      replicas: 2
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/taskqueue
+      WORKER_CONCURRENCY: 3
+      LEASE_DURATION_SECONDS: 30
+      HEARTBEAT_INTERVAL_SECONDS: 10
+      STALE_LEASE_CHECK_INTERVAL_SECONDS: 15
+      POLL_INTERVAL_MS: 500
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_SERVICE_NAME: task-queue-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    ports:
+      - '5173:80'
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    ports:
+      - '9090:9090'
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - '16686:16686'
+      - '4318:4318'
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    restart: unless-stopped
+
+volumes:
+  pg_data:

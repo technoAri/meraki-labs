@@ -1,0 +1,12 @@
+{
+  "name": "task-queue-platform",
+  "private": true,
+  "scripts": {
+    "dev": "docker-compose up --build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}
