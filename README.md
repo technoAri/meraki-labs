@@ -120,7 +120,7 @@ x-api-key: test-e2e-key-5678
 
 ```bash
 curl -X POST http://localhost/v1/jobs \
-  -H "x-api-key: test-api-key-1234" \
+  -H "x-api-key: test-e2e-key-5678" \
   -H "Content-Type: application/json" \
   -d '{
     "payload":         { "task": "send-email", "to": "user@example.com" },
@@ -147,23 +147,23 @@ Submit `{"fail": true}` in the payload to simulate a failing job (useful for DLQ
 
 ```bash
 # List jobs — newest first, 50 per page
-curl http://localhost/v1/jobs -H "x-api-key: test-api-key-1234"
+curl http://localhost/v1/jobs -H "x-api-key: test-e2e-key-5678"
 # → {"data": [...], "nextCursor": "<token>|null"}
 
 # Next page — pass the cursor from the previous response
-curl "http://localhost/v1/jobs?cursor=<token>" -H "x-api-key: test-api-key-1234"
+curl "http://localhost/v1/jobs?cursor=<token>" -H "x-api-key: test-e2e-key-5678"
 
 # Filter by status: pending | running | completed | failed | dead_letter
-curl "http://localhost/v1/jobs?status=pending" -H "x-api-key: test-api-key-1234"
+curl "http://localhost/v1/jobs?status=pending" -H "x-api-key: test-e2e-key-5678"
 
 # Custom page size (max 200)
-curl "http://localhost/v1/jobs?limit=20" -H "x-api-key: test-api-key-1234"
+curl "http://localhost/v1/jobs?limit=20" -H "x-api-key: test-e2e-key-5678"
 
 # Get a specific job
-curl http://localhost/v1/jobs/<id> -H "x-api-key: test-api-key-1234"
+curl http://localhost/v1/jobs/<id> -H "x-api-key: test-e2e-key-5678"
 
 # Live counts per status (Redis-cached, 3s TTL)
-curl http://localhost/v1/jobs/counts -H "x-api-key: test-api-key-1234"
+curl http://localhost/v1/jobs/counts -H "x-api-key: test-e2e-key-5678"
 # → {"pending":3,"running":1,"completed":47,"failed":2,"dead_letter":1}
 ```
 
@@ -175,7 +175,7 @@ Pagination uses a **cursor**, not an offset. The cursor encodes the position of 
 
 ```bash
 curl -X POST http://localhost/v1/jobs/<id>/cancel \
-  -H "x-api-key: test-api-key-1234"
+  -H "x-api-key: test-e2e-key-5678"
 ```
 
 Only works on `pending` jobs. Sets status to `failed` with error `"Cancelled by user"`.
@@ -186,15 +186,15 @@ Only works on `pending` jobs. Sets status to `failed` with error `"Cancelled by 
 
 ```bash
 # List dead-lettered jobs — 50 per page, newest first
-curl http://localhost/v1/dlq -H "x-api-key: test-api-key-1234"
+curl http://localhost/v1/dlq -H "x-api-key: test-e2e-key-5678"
 # → {"data": [...], "nextCursor": "<token>|null"}
 
 # Next page
-curl "http://localhost/v1/dlq?cursor=<token>" -H "x-api-key: test-api-key-1234"
+curl "http://localhost/v1/dlq?cursor=<token>" -H "x-api-key: test-e2e-key-5678"
 
 # Re-queue a dead-lettered job (resets attempts to 0, strips simulation flags from payload)
 curl -X POST http://localhost/v1/dlq/<id>/retry \
-  -H "x-api-key: test-api-key-1234"
+  -H "x-api-key: test-e2e-key-5678"
 ```
 
 ---
@@ -235,7 +235,7 @@ HTTP 429 Too Many Requests
 ### WebSocket — Real-time Updates
 
 ```
-ws://localhost/ws?api_key=test-api-key-1234
+ws://localhost/ws?api_key=test-e2e-key-5678
 ```
 
 Pushes a message on every job status change:
