@@ -315,30 +315,25 @@ Traces link the full path from API request → PostgreSQL → worker execution, 
 
 ### Structured logs (Pino)
 
-#### Viewing logs
+Both services use [Pino](https://github.com/pinojs/pino) for structured logging. They emit different formats depending on `NODE_ENV`:
 
+---
+
+#### API logs (pino-pretty, human-readable)
+
+The API runs with `NODE_ENV=development` so logs are formatted by pino-pretty — colorized and multi-line.
+
+**How to view:**
 ```bash
-# Follow logs from a specific container
 docker logs meraki-labs-api-1 -f
 docker logs meraki-labs-api-2 -f
-docker logs meraki-labs-worker-1 -f
-docker logs meraki-labs-worker-2 -f
-
-# All services at once
-docker compose logs -f
-
-# Filter to errors only
-docker compose logs -f | grep '"level":50\|ERROR'
-
-# Follow a specific job through the system
-docker compose logs -f | grep '<job-uuid>'
 ```
 
-#### Log formats
-
-**API (development mode — pino-pretty, human-readable):**
+**What you see:**
 ```
 [08:12:10.897] INFO (1): Migrations complete
+[08:12:10.909] INFO (1): Server listening at http://0.0.0.0:3000
+
 [08:12:25.188] INFO (1): incoming request
     reqId: "req-2"
     req: {
@@ -351,85 +346,142 @@ docker compose logs -f | grep '<job-uuid>'
     reqId: "req-2"
     res: { "statusCode": 201 }
     responseTime: 25.306
+
+[08:13:01.512] WARN (1): Malformed job_status_change notification
+
+[08:13:05.001] ERROR (1): LISTEN job_status_change failed
+    err: {
+      "type": "Error",
+      "message": "Connection terminated unexpectedly"
+    }
 ```
 
-**Worker (JSON — one object per line):**
+Every request gets a `reqId` that links the `incoming request` and `request completed` lines together. Use it to correlate request logs:
+```bash
+docker logs meraki-labs-api-1 2>&1 | grep "req-42"
+```
+
+---
+
+#### Worker logs (raw JSON)
+
+The worker emits raw Pino JSON — one object per line.
+
+**How to view:**
+```bash
+# Raw JSON
+docker logs meraki-labs-worker-1 -f
+
+# Readable with jq (requires jq installed)
+docker logs meraki-labs-worker-1 -f | jq .
+```
+
+**What you see:**
 ```json
-{"level":30,"time":1716825600000,"pid":1,"hostname":"worker-1","workerId":"6d510e66-...","msg":"Worker started"}
-{"level":30,"time":1716825601000,"pid":1,"hostname":"worker-1","jobId":"d4e5f6-...","tenantId":"6597972f-...","msg":"Claimed job"}
-{"level":30,"time":1716825615000,"pid":1,"hostname":"worker-1","count":1,"msg":"Recovered stale leases"}
-{"level":50,"time":1716825620000,"pid":1,"hostname":"worker-1","jobId":"d4e5f6-...","err":{"type":"Error","message":"Simulated job failure","stack":"Error: Simulated job failure\n    at simulateWork..."},"msg":"Unhandled executor error"}
+{"level":30,"time":1716825600000,"pid":1,"hostname":"43624d78516e","workerId":"6d510e66-3339-4ea2-80bc-f87dc13bbccf","msg":"Worker started"}
+{"level":30,"time":1716825601000,"pid":1,"hostname":"43624d78516e","msg":"Worker metrics server on :9091"}
+{"level":30,"time":1716825602000,"pid":1,"hostname":"43624d78516e","jobId":"d4e5f6-...","tenantId":"6597972f-...","msg":"Claimed job"}
+{"level":30,"time":1716825615000,"pid":1,"hostname":"43624d78516e","count":2,"msg":"Recovered stale leases"}
+{"level":50,"time":1716825620000,"pid":1,"hostname":"43624d78516e","jobId":"d4e5f6-...","err":{"type":"Error","message":"Simulated job failure","stack":"Error: Simulated job failure\n    at simulateWork (executor.js:22:9)"},"msg":"Unhandled executor error"}
+{"level":30,"time":1716825700000,"pid":1,"hostname":"43624d78516e","msg":"Worker stopped"}
 ```
 
-#### Log level reference
+**Log level values:** `30` = info, `40` = warn, `50` = error
 
-| Level | Value | Used for |
+---
+
+#### System logs
+
+System logs are `info`-level events that confirm the lifecycle of each service. They are always emitted — no configuration needed.
+
+| Log message | Service | When it appears |
 |---|---|---|
-| `info` | 30 | Normal operations: job claimed, worker started, migrations complete |
-| `warn` | 40 | Degraded but not failing: malformed pg_notify payload |
-| `error` | 50 | Failures requiring attention: executor crash, DB connection failure, startup error |
-
-#### System events and what they mean
-
-| Message | Service | Meaning |
-|---|---|---|
-| `Migrations complete` | api | DB schema is up to date, server is about to start |
-| `Server listening at http://0.0.0.0:3000` | api | API replica is ready |
-| `Worker started` | worker | Worker loop running, includes `workerId` UUID |
+| `Migrations complete` | api | DB schema applied, server is about to bind |
+| `Server listening at http://0.0.0.0:3000` | api | Replica is ready to accept requests |
+| `Worker started` | worker | Worker loop is running — `workerId` field identifies this instance |
 | `Worker metrics server on :9091` | worker | Prometheus scrape endpoint is up |
-| `Claimed job` | worker | Job moved from `pending` to `running`, includes `jobId` and `tenantId` |
-| `Recovered stale leases` | worker | Crashed worker's jobs reclaimed, includes `count` |
-| `Worker stopped` | worker | Graceful shutdown complete (SIGTERM received) |
-| `LISTEN job_status_change failed` | api | Redis pub/sub channel failed — WebSocket updates will stop |
-| `Malformed job_status_change notification` | api | A pg_notify payload couldn't be parsed as JSON |
+| `Claimed job` | worker | Job moved `pending → running` — `jobId` and `tenantId` always present |
+| `Recovered stale leases` | worker | Expired leases reclaimed — `count` field shows how many jobs were re-queued |
+| `Worker stopped` | worker | Clean shutdown after SIGTERM |
 
-#### Error log scenarios
+**How to monitor system events in real time:**
+```bash
+# Watch all system events across both workers
+docker logs meraki-labs-worker-1 -f | jq 'select(.level == 30)'
+docker logs meraki-labs-worker-2 -f | jq 'select(.level == 30)'
 
-**Job executor crash (worker):**
-```json
-{"level":50,"jobId":"...","err":{"message":"Simulated job failure","stack":"..."},"msg":"Unhandled executor error"}
-```
-The job is nacked — either retried or dead-lettered depending on attempt count.
+# Watch only stale lease recovery (indicates a worker crashed)
+docker compose logs -f worker | grep "Recovered stale leases"
 
-**Worker loop error (worker):**
-```json
-{"level":50,"err":{"message":"connect ECONNREFUSED 10.0.0.5:5432"},"msg":"Worker loop error"}
-```
-Transient DB connectivity failure. The worker continues polling on the next interval.
-
-**Fatal startup error (worker):**
-```json
-{"level":50,"err":{"message":"password authentication failed"},"msg":"Fatal worker error"}
-```
-Process exits. Container restarts per the `restart: unless-stopped` policy.
-
-**API startup failure (api):**
-```
-[ERROR] (1): password authentication failed for user "postgres"
-```
-Process exits with code 1. Container restarts automatically.
-
-**401 Unauthorized (api request log):**
-```
-[WARN] request completed  reqId: "req-5"  res: { "statusCode": 401 }
+# Count how many jobs each worker has claimed (since container start)
+docker logs meraki-labs-worker-1 2>&1 | grep -c "Claimed job"
 ```
 
-**429 Rate limited (api request log):**
-```
-[INFO] request completed  reqId: "req-61"  res: { "statusCode": 429 }  responseTime: 1.2
+---
+
+#### Error logs
+
+Error logs are `error`-level (`"level":50` in JSON, `ERROR` in pino-pretty). Every error in the system has a specific message and known recovery behaviour.
+
+**How to monitor errors across all services:**
+```bash
+# All errors in real time (works for both log formats)
+docker compose logs -f | grep -E '"level":50|ERROR'
+
+# Worker errors only (with jq for clean output)
+docker logs meraki-labs-worker-1 -f | jq 'select(.level == 50)'
+
+# API errors (grep the pino-pretty ERROR line and 2 lines of context)
+docker logs meraki-labs-api-1 -f 2>&1 | grep -A2 "ERROR"
 ```
 
-#### Switching to JSON logs in all services
+**Implemented error events:**
 
-To get raw JSON from the API (e.g. for log aggregation in production), set `NODE_ENV=production` in `docker-compose.yml`:
+| Error message | Service | Cause | Recovery |
+|---|---|---|---|
+| `Unhandled executor error` | worker | Job threw an uncaught exception | Job is nacked — retried or dead-lettered based on attempt count |
+| `Worker loop error` | worker | Transient DB failure during poll/claim cycle | Worker sleeps 500ms and retries automatically |
+| `Fatal worker error` | worker | Startup failure (bad DB credentials, missing env var) | Container exits → Docker restarts it (`restart: unless-stopped`) |
+| `LISTEN job_status_change failed` | api | pg_notify channel setup failed | WebSocket updates stop for that replica; API requests still work |
+| API startup error (no message field) | api | DB unreachable at boot, port conflict | Container exits → Docker restarts it |
+
+**Example: spotting a job that failed and landed in DLQ:**
+```bash
+# Find the error that caused a specific job to dead-letter
+docker compose logs worker | grep '<job-uuid>'
+
+# Output shows the claim, then the executor error:
+# {"msg":"Claimed job","jobId":"d4e5f6","tenantId":"..."}
+# {"msg":"Unhandled executor error","jobId":"d4e5f6","err":{"message":"Simulated job failure",...}}
+```
+
+**Example: detecting a worker crash (stale lease recovery fires):**
+```bash
+docker compose logs worker | grep "Recovered stale leases"
+# {"msg":"Recovered stale leases","count":3}
+# count > 0 means at least one worker died mid-job
+```
+
+---
+
+#### Switching to JSON logs for all services
+
+To emit raw JSON from the API (useful when shipping logs to Datadog, CloudWatch, Loki, etc.), change `NODE_ENV` in `docker-compose.yml`:
+
 ```yaml
-environment:
-  NODE_ENV: production   # disables pino-pretty, emits raw JSON
+# In the api service environment block:
+NODE_ENV: production   # disables pino-pretty, emits raw JSON
 ```
 
-Then pipe through `jq` for readable output:
+Then rebuild and restart:
+```bash
+docker compose build api && docker compose up -d api
+```
+
+All logs can then be parsed uniformly:
 ```bash
 docker logs meraki-labs-api-1 -f | grep '{"level"' | jq .
+docker logs meraki-labs-worker-1 -f | jq .
 ```
 
 ---
