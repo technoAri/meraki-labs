@@ -5,15 +5,18 @@ WORKDIR /app
 
 COPY package.json pnpm-workspace.yaml ./
 COPY packages/shared/package.json ./packages/shared/
+COPY apps/api/package.json ./apps/api/
+COPY apps/worker/package.json ./apps/worker/
 COPY apps/dashboard/package.json ./apps/dashboard/
+COPY e2e/package.json ./e2e/
 
 RUN pnpm install
 
 COPY packages/shared ./packages/shared
 COPY apps/dashboard ./apps/dashboard
 
-ARG VITE_API_URL=http://localhost:3000
-ARG VITE_WS_URL=ws://localhost:3000/ws
+ARG VITE_API_URL=http://localhost/v1
+ARG VITE_WS_URL=ws://localhost/ws
 ARG VITE_API_KEY=test-api-key-1234
 
 ENV VITE_API_URL=$VITE_API_URL

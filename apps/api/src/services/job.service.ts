@@ -1,8 +1,9 @@
 import { trace } from '@opentelemetry/api';
 import type { Job, JobStatus, Json } from '@task-queue/shared';
-import { sql } from '../db/client.js';
+import { sql, readWithFallback } from '../db/client.js';
 import { jobsSubmittedTotal, jobsPendingGauge } from '../metrics/prometheus.js';
 import { broadcast } from '../ws/websocket.js';
+import { getCachedCounts, setCachedCounts, invalidateCounts, type CachedCounts } from '../cache/countsCache.js';
 
 const tracer = trace.getTracer('job.service');
 
@@ -33,18 +34,19 @@ export async function submitJob(input: SubmitJobInput): Promise<Job> {
       `;
 
       if (rows.length === 0) {
-        const existing = await sql<Job[]>`
+        const existing = await readWithFallback((db) => db<Job[]>`
           SELECT * FROM jobs
           WHERE tenant_id = ${input.tenantId}
             AND idempotency_key = ${input.idempotencyKey!}
           LIMIT 1
-        `;
+        `);
         return existing[0];
       }
 
       const job = rows[0];
       jobsSubmittedTotal.inc({ tenant_id: input.tenantId });
       jobsPendingGauge.inc({ tenant_id: input.tenantId });
+      void invalidateCounts(input.tenantId);
       return job;
     } finally {
       span.end();
@@ -53,52 +55,49 @@ export async function submitJob(input: SubmitJobInput): Promise<Job> {
 }
 
 export async function getJob(jobId: string, tenantId: string): Promise<Job | null> {
-  const rows = await sql<Job[]>`
+  const rows = await readWithFallback((db) => db<Job[]>`
     SELECT * FROM jobs WHERE id = ${jobId} AND tenant_id = ${tenantId} LIMIT 1
-  `;
+  `);
   return rows[0] ?? null;
 }
 
-export async function listJobs(
-  tenantId: string,
-  status?: JobStatus
-): Promise<Job[]> {
+export async function listJobs(tenantId: string, status?: JobStatus): Promise<Job[]> {
   if (status) {
-    return sql<Job[]>`
+    return readWithFallback((db) => db<Job[]>`
       SELECT * FROM jobs
       WHERE tenant_id = ${tenantId} AND status = ${status}
       ORDER BY created_at DESC
       LIMIT 100
-    `;
+    `);
   }
-  return sql<Job[]>`
+  return readWithFallback((db) => db<Job[]>`
     SELECT * FROM jobs
     WHERE tenant_id = ${tenantId}
     ORDER BY created_at DESC
     LIMIT 100
-  `;
+  `);
 }
 
-export interface JobCounts {
-  pending: number;
-  running: number;
-  completed: number;
-  failed: number;
-  dead_letter: number;
-}
+export type JobCounts = CachedCounts;
 
 export async function getJobCounts(tenantId: string): Promise<JobCounts> {
-  const rows = await sql<{ status: string; count: number }[]>`
+  const cached = await getCachedCounts(tenantId);
+  if (cached) return cached;
+
+  const rows = await readWithFallback((db) => db<{ status: string; count: number }[]>`
     SELECT status, COUNT(*)::int AS count
     FROM jobs
     WHERE tenant_id = ${tenantId}
     GROUP BY status
-  `;
+  `);
+
   const result: JobCounts = { pending: 0, running: 0, completed: 0, failed: 0, dead_letter: 0 };
   for (const row of rows) {
-    const key = row.status as keyof JobCounts;
-    if (key in result) result[key] = row.count;
+    const k = row.status as keyof JobCounts;
+    if (k in result) result[k] = row.count;
   }
+
+  void setCachedCounts(tenantId, result);
   return result;
 }
 
@@ -111,6 +110,7 @@ export async function cancelJob(jobId: string, tenantId: string): Promise<Job | 
   `;
   if (rows.length > 0) {
     jobsPendingGauge.dec({ tenant_id: tenantId });
+    void invalidateCounts(tenantId);
     broadcast({ type: 'JOB_UPDATE', data: { id: rows[0].id, tenant_id: tenantId, status: 'failed', updated_at: rows[0].updated_at } });
   }
   return rows[0] ?? null;

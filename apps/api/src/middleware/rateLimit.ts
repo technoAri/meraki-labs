@@ -1,7 +1,8 @@
 import type { FastifyRequest, FastifyReply } from 'fastify';
+import { redis } from '../cache/redis.js';
 
-const windowMs = 60_000;
-const requestLog = new Map<string, number[]>();
+const WINDOW_MS = 60_000;
+const WINDOW_SECONDS = 60;
 
 export async function rateLimitMiddleware(
   request: FastifyRequest,
@@ -9,18 +10,28 @@ export async function rateLimitMiddleware(
 ): Promise<void> {
   const { tenant } = request;
   const now = Date.now();
-  const cutoff = now - windowMs;
+  const key = `ratelimit:${tenant.id}`;
 
-  let timestamps = requestLog.get(tenant.id) ?? [];
-  timestamps = timestamps.filter((t) => t > cutoff);
-  timestamps.push(now);
-  requestLog.set(tenant.id, timestamps);
+  try {
+    const pipeline = redis.pipeline();
+    pipeline.zremrangebyscore(key, 0, now - WINDOW_MS);
+    pipeline.zadd(key, now, `${now}-${Math.random().toString(36).slice(2)}`);
+    pipeline.zcard(key);
+    pipeline.expire(key, WINDOW_SECONDS + 1);
+    const results = await pipeline.exec();
 
-  if (timestamps.length > tenant.rate_limit_per_minute) {
-    const retryAfter = Math.ceil((timestamps[0] + windowMs - now) / 1000);
-    reply
-      .code(429)
-      .header('Retry-After', String(retryAfter))
-      .send({ error: 'Rate limit exceeded', retryAfter });
+    const count = (results?.[2]?.[1] as number) ?? 0;
+
+    if (count > tenant.rate_limit_per_minute) {
+      const oldest = await redis.zrange(key, 0, 0, 'WITHSCORES');
+      const oldestMs = oldest[1] ? Number(oldest[1]) : now;
+      const retryAfter = Math.max(1, Math.ceil((oldestMs + WINDOW_MS - now) / 1000));
+      reply
+        .code(429)
+        .header('Retry-After', String(retryAfter))
+        .send({ error: 'Rate limit exceeded', retryAfter });
+    }
+  } catch {
+    // Redis unavailable — fail open to avoid blocking all requests
   }
 }

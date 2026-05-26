@@ -3,6 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import type { IncomingMessage } from 'http';
 import { sql } from '../db/client.js';
 import type { WSMessage } from '@task-queue/shared';
+import { getTenantByApiKey } from '../cache/tenantCache.js';
+import { invalidateCounts } from '../cache/countsCache.js';
 
 interface AuthedSocket extends WebSocket {
   tenantId: string;
@@ -16,6 +18,7 @@ export function setupWebSocket(app: FastifyInstance): void {
   sql.listen('job_status_change', (payload) => {
     try {
       const data = JSON.parse(payload) as WSMessage['data'];
+      void invalidateCounts(data.tenant_id);
       broadcast({ type: 'JOB_UPDATE', data });
     } catch {
       app.log.warn('Malformed job_status_change notification');
@@ -31,16 +34,14 @@ export function setupWebSocket(app: FastifyInstance): void {
       return;
     }
 
-    const rows = await sql<{ id: string }[]>`
-      SELECT id FROM tenants WHERE api_key = ${apiKey} LIMIT 1
-    `;
+    const tenant = await getTenantByApiKey(apiKey);
 
-    if (rows.length === 0) {
+    if (!tenant) {
       socket.close(1008, 'Invalid api_key');
       return;
     }
 
-    (socket as AuthedSocket).tenantId = rows[0].id;
+    (socket as AuthedSocket).tenantId = tenant.id;
     socket.on('error', () => socket.terminate());
   });
 }

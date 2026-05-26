@@ -1,6 +1,6 @@
 import type { FastifyRequest, FastifyReply } from 'fastify';
-import { sql } from '../db/client.js';
 import type { Tenant } from '@task-queue/shared';
+import { getTenantByApiKey } from '../cache/tenantCache.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -18,14 +18,12 @@ export async function authMiddleware(
     return;
   }
 
-  const rows = await sql<Tenant[]>`
-    SELECT * FROM tenants WHERE api_key = ${apiKey} LIMIT 1
-  `;
+  const tenant = await getTenantByApiKey(apiKey);
 
-  if (rows.length === 0) {
+  if (!tenant) {
     reply.code(401).send({ error: 'Invalid API key' });
     return;
   }
 
-  request.tenant = rows[0];
+  request.tenant = tenant;
 }

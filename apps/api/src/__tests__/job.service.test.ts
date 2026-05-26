@@ -5,7 +5,11 @@ const mockSql = Object.assign(vi.fn(), {
   json: vi.fn((v: unknown) => v),
   array: vi.fn((v: unknown) => v),
 });
-vi.mock('../db/client.js', () => ({ sql: mockSql }));
+vi.mock('../db/client.js', () => ({
+  sql: mockSql,
+  readWithFallback: (queryFn: (db: typeof mockSql) => unknown) => queryFn(mockSql),
+}));
+vi.mock('../cache/countsCache.js', () => ({ invalidateCounts: vi.fn() }));
 vi.mock('../metrics/prometheus.js', () => ({
   jobsSubmittedTotal: { inc: vi.fn() },
   jobsPendingGauge: { inc: vi.fn() },

@@ -8,33 +8,41 @@ Read this entirely before writing any file. Do not deviate from decisions made h
 ## Project Overview
 
 Build a production-minded distributed task queue and job processing platform with:
+- nginx API gateway load-balancing across multiple API replicas
 - Authenticated REST API for job submission and status checks
 - Durable PostgreSQL-backed job store with SKIP LOCKED queue semantics
+- PostgreSQL WAL streaming replication — primary handles all reads + writes; replica is a warm standby for read fallback if primary fails
+- Redis for distributed rate limiting and hot-path caching (tenant auth, job counts)
 - Worker fleet with lease / ack / retry / DLQ behavior
 - Per-tenant rate limiting and concurrency quotas
 - Observability: Prometheus metrics, OpenTelemetry tracing, Pino structured logs
 - Real-time React dashboard (responsive: Desktop, Tablet, Mobile) via WebSockets
+- Playwright E2E test suite covering the full job lifecycle
 
 ---
 
-## Technology Stack — Non-Negotiable
+## Technology Stack
 
 | Layer | Choice | Reason |
 |---|---|---|
 | Runtime | Node.js 20 LTS | Stable, widely supported |
 | Language | TypeScript (strict mode) | Type safety across the whole system |
 | API framework | Fastify v4 | Better TypeScript support, faster than Express |
-| ORM / DB client | `postgres` (raw pg driver) | Show explicit SKIP LOCKED understanding |
-| Database | PostgreSQL 16 | Job store + queue + tenant config |
-| Auth | API key (header: `x-api-key`) | Simple, auditable for work trial |
-| Rate limiting | In-memory sliding window per tenant (no Redis) | Keeps stack simpler; Redis is not required |
-| WebSockets | `ws` library on Fastify | Lightweight, standard |
+| ORM / DB client | `postgres` (raw pg driver) | Explicit SKIP LOCKED understanding |
+| Database | PostgreSQL 16 (bitnami/postgresql) | Job store + queue + tenant config; bitnami image enables WAL replication via env vars |
+| DB replication | WAL streaming (primary → replica) | Read fallback on primary failure; all traffic normally hits primary |
+| Cache / rate limit store | Redis 7 | Distributed rate limiting across API replicas; tenant auth cache; job counts cache |
+| Gateway / LB | nginx | Single entry point on :80, round-robin across API replicas; sticky WS upgrade |
+| Auth | API key (header: `x-api-key`) | Simple, auditable |
+| Rate limiting | Redis sliding window per tenant | Globally consistent across all API replicas |
+| WebSockets | `ws` library on Fastify | Each API replica independently LISTENs to pg_notify and broadcasts to its own connected clients |
 | Metrics | `prom-client` | Standard Prometheus client for Node |
-| Tracing | `@opentelemetry/sdk-node` + OTLP exporter → Jaeger | Full trace UI at :16686; Jaeger is free/Apache 2.0 |
+| Tracing | `@opentelemetry/sdk-node` + OTLP exporter → Jaeger | Full trace UI at :16686 |
 | Logging | `pino` + `pino-pretty` (dev) | Structured JSON logs with correlation IDs |
-| Frontend | React 18 + Vite + Tailwind CSS + shadcn/ui | TypeScript ecosystem, fast responsive layout |
-| Testing | Vitest | Fast, native TypeScript support |
-| Containers | Docker + Docker Compose | Single `docker-compose up` must reproduce everything |
+| Frontend | React 18 + Vite + Tailwind CSS | TypeScript ecosystem, fast responsive layout |
+| Unit testing | Vitest | Fast, native TypeScript support |
+| E2E testing | Playwright | Browser-level proof that the full job lifecycle works |
+| Containers | Docker + Docker Compose | Single `docker compose up` reproduces everything |
 | Package manager | pnpm workspaces | Monorepo management |
 
 ---
@@ -46,11 +54,12 @@ Build a production-minded distributed task queue and job processing platform wit
 ├── apps/
 │   ├── api/                  # Fastify API server
 │   │   ├── src/
-│   │   │   ├── routes/       # job.routes.ts, tenant.routes.ts, metrics.routes.ts
-│   │   │   ├── middleware/   # auth.ts, rateLimit.ts, tracing.ts
+│   │   │   ├── routes/       # job.routes.ts, dlq.routes.ts, metrics.routes.ts
+│   │   │   ├── middleware/   # auth.ts, rateLimit.ts
 │   │   │   ├── services/     # job.service.ts, quota.service.ts
-│   │   │   ├── db/           # client.ts, schema.sql, migrations/
-│   │   │   ├── ws/           # websocket.ts (real-time broadcast)
+│   │   │   ├── db/           # client.ts (primary + replica pools), schema.sql, migrations/
+│   │   │   ├── cache/        # redis.ts (client), tenantCache.ts, countsCache.ts
+│   │   │   ├── ws/           # websocket.ts (real-time broadcast via pg_notify LISTEN)
 │   │   │   ├── metrics/      # prometheus.ts (prom-client setup)
 │   │   │   └── index.ts
 │   │   ├── Dockerfile
@@ -66,24 +75,32 @@ Build a production-minded distributed task queue and job processing platform wit
 │   │   ├── Dockerfile
 │   │   └── package.json
 │   │
-│   └── dashboard/            # React + Vite frontend
-│       ├── src/
-│       │   ├── components/   # JobTable, StatusBadge, SubmitForm, DLQPanel, MetricsBar
-│       │   ├── hooks/        # useWebSocket.ts, useJobs.ts
-│       │   ├── pages/        # Dashboard.tsx, DLQ.tsx
-│       │   └── main.tsx
-│       ├── Dockerfile
+│   ├── dashboard/            # React + Vite frontend (served by nginx gateway)
+│   │   ├── src/
+│   │   │   ├── components/   # JobTable, StatusBadge, SubmitJobForm, DLQPanel, MetricsBar
+│   │   │   ├── hooks/        # useWebSocket.ts, useJobs.ts, useJobCounts.ts
+│   │   │   ├── pages/        # Dashboard.tsx, DLQ.tsx
+│   │   │   └── main.tsx
+│   │   ├── Dockerfile
+│   │   └── package.json
+│   │
+│   └── e2e/                  # Playwright end-to-end tests
+│       ├── tests/
+│       │   └── job-lifecycle.spec.ts
+│       ├── playwright.config.ts
 │       └── package.json
 │
 ├── packages/
-│   └── shared/               # Shared types only — no business logic here
+│   └── shared/               # Shared types only — no business logic
 │       ├── src/
-│       │   └── types.ts      # JobStatus, Job, Tenant, WSMessage interfaces
+│       │   └── types.ts      # JobStatus, Job, Tenant, WSMessage, Json interfaces
 │       └── package.json
 │
 ├── docker/
+│   ├── nginx/
+│   │   └── nginx.conf        # Gateway: LB across API replicas, WS upgrade
 │   └── prometheus/
-│       └── prometheus.yml    # Scrape config for api + worker
+│       └── prometheus.yml    # Scrape config for api replicas + workers
 │
 ├── docker-compose.yml
 ├── CLAUDE.md                 # This file
@@ -129,7 +146,6 @@ CREATE TABLE jobs (
   UNIQUE (tenant_id, idempotency_key)
 );
 
--- Critical indexes
 CREATE INDEX idx_jobs_claim
   ON jobs (status, priority DESC, scheduled_at ASC)
   WHERE status = 'pending';
@@ -141,14 +157,13 @@ CREATE INDEX idx_jobs_lease_expiry
   ON jobs (lease_expires_at)
   WHERE status = 'running';
 
--- Seed one test tenant
 INSERT INTO tenants (name, api_key, rate_limit_per_minute, max_concurrent_jobs)
 VALUES ('test-tenant', 'test-api-key-1234', 60, 5);
 ```
 
 ---
 
-## Core Patterns — Implement Exactly As Specified
+## Core Patterns
 
 ### 1. SKIP LOCKED Job Claim (claimer.ts)
 
@@ -174,18 +189,15 @@ WHERE id = (
 RETURNING *;
 ```
 
-- `$1` = worker UUID (generated once at worker startup)
-- `$2` = array of tenant IDs that are under their concurrency quota at claim time
-
 ### 2. Lease Heartbeat (leaser.ts)
 
-Worker must renew the lease every 10 seconds:
+Worker renews the lease every 10 seconds:
 ```sql
 UPDATE jobs
 SET lease_expires_at = NOW() + INTERVAL '30 seconds', updated_at = NOW()
 WHERE id = $1 AND worker_id = $2 AND status = 'running';
 ```
-If this returns 0 rows — another worker reclaimed the job. Abort immediately.
+Returns 0 rows → job was stolen. Worker aborts immediately.
 
 ### 3. Ack / Nack (executor.ts)
 
@@ -199,14 +211,16 @@ On failure:
 ```sql
 UPDATE jobs
 SET
-  status    = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'failed' END,
-  error     = $3,
-  updated_at = NOW()
+  status           = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'pending' END,
+  worker_id        = CASE WHEN attempts >= max_attempts THEN worker_id ELSE NULL END,
+  lease_expires_at = CASE WHEN attempts >= max_attempts THEN lease_expires_at ELSE NULL END,
+  error            = $3,
+  updated_at       = NOW()
 WHERE id = $1 AND worker_id = $2
-RETURNING status;
+RETURNING status, updated_at;
 ```
 
-### 4. Stale Lease Recovery (run every 15s in worker loop)
+### 4. Stale Lease Recovery (every 15s)
 
 ```sql
 UPDATE jobs
@@ -216,25 +230,33 @@ WHERE status = 'running' AND lease_expires_at < NOW();
 
 ### 5. Idempotency
 
-Job submission must check for existing idempotency_key per tenant:
 ```sql
 INSERT INTO jobs (tenant_id, idempotency_key, payload, priority, max_attempts)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
 RETURNING *;
 ```
-If RETURNING is empty — duplicate. Return 200 with original job (fetch by idempotency_key).
+Empty RETURNING → duplicate. Fetch and return original by idempotency_key.
 
-### 6. Per-Tenant Rate Limiting (in-memory, middleware)
+### 6. Per-Tenant Rate Limiting — Redis sliding window
 
-Use a sliding window counter per `tenant_id`. Implementation in `middleware/rateLimit.ts`:
-- Store: `Map<tenantId, number[]>` — array of request timestamps
-- On each request: prune entries older than 60s, check length against `rate_limit_per_minute`
-- On breach: return 429 with `Retry-After` header
+Implementation in `middleware/rateLimit.ts`. Uses Redis ZADD + ZREMRANGEBYSCORE for a sorted-set sliding window — globally consistent across all API replicas:
+
+```
+key:   ratelimit:{tenantId}
+type:  sorted set (score = timestamp ms, member = timestamp ms)
+
+On each request:
+  ZREMRANGEBYSCORE key 0 (now - 60000)   # prune old entries
+  ZADD key now now                        # add this request
+  ZCARD key                               # count in window
+  EXPIRE key 61                           # auto-cleanup
+
+If ZCARD > rate_limit_per_minute → 429
+```
 
 ### 7. Concurrency Quota (quota.service.ts)
 
-Before claim, fetch tenants whose running job count is under limit:
 ```sql
 SELECT t.id
 FROM tenants t
@@ -243,7 +265,48 @@ WHERE (
   WHERE j.tenant_id = t.id AND j.status = 'running'
 ) < t.max_concurrent_jobs;
 ```
-Pass resulting tenant IDs into the SKIP LOCKED claim query.
+
+### 8. Tenant Auth Cache — Redis
+
+Implementation in `cache/tenantCache.ts`. Avoids a DB hit on every authenticated request:
+
+```
+key:   tenant:apikey:{apiKey}
+value: tenantId (string)
+TTL:   300s
+
+On auth:
+  1. GET tenant:apikey:{apiKey} from Redis
+  2. If hit → use cached tenantId
+  3. If miss → SELECT from DB, SET in Redis with TTL
+```
+
+### 9. Job Counts Cache — Redis
+
+Implementation in `cache/countsCache.ts`. Prevents repeated GROUP BY aggregation when the dashboard polls:
+
+```
+key:   counts:{tenantId}
+value: JSON { pending, running, completed, failed, dead_letter }
+TTL:   3s
+
+Invalidated (deleted) on any JOB_UPDATE pg_notify for that tenant.
+```
+
+### 10. PostgreSQL Read Replica Fallback
+
+`apps/api/src/db/client.ts` exports two pools:
+
+```ts
+export const sql = postgres(process.env.DATABASE_URL);        // primary — all writes + normal reads
+export const sqlRead = postgres(process.env.DATABASE_READ_URL // replica
+  ?? process.env.DATABASE_URL);                               // falls back to primary if replica not configured
+```
+
+All SELECT-only queries in services use `sqlRead`. All INSERT/UPDATE/DELETE use `sql`.
+If `DATABASE_READ_URL` is not set (e.g. local dev without replica), both point to the same DB — no code change needed.
+
+Workers always use `sql` (primary) because claim/ack/nack are all writes.
 
 ---
 
@@ -251,8 +314,9 @@ Pass resulting tenant IDs into the SKIP LOCKED claim query.
 
 ```
 POST   /jobs              Submit a job (auth required)
+GET    /jobs/counts       Live counts per status for tenant (auth required)
 GET    /jobs/:id          Get job status (auth required)
-GET    /jobs              List jobs for tenant (auth required, ?status=pending|running|completed|failed|dead_letter)
+GET    /jobs              List jobs for tenant (auth required, ?status=...)
 POST   /jobs/:id/cancel   Cancel a pending job
 GET    /dlq               List dead letter jobs for tenant
 POST   /dlq/:id/retry     Re-queue a dead_letter job back to pending
@@ -263,9 +327,7 @@ WS     /ws                WebSocket connection (auth via ?api_key= query param)
 
 ---
 
-## Prometheus Metrics to Expose
-
-Define all in `apps/api/src/metrics/prometheus.ts`:
+## Prometheus Metrics
 
 ```ts
 jobs_submitted_total        // Counter, labels: tenant_id
@@ -282,22 +344,16 @@ worker_lease_renewals_total // Counter, labels: worker_id
 
 ## WebSocket Protocol
 
-Server broadcasts on every job status change:
-
 ```ts
-// WSMessage shape (defined in packages/shared/src/types.ts)
 {
   type: 'JOB_UPDATE',
-  data: {
-    id: string,
-    tenant_id: string,
-    status: JobStatus,
-    updated_at: string
-  }
+  data: { id: string, tenant_id: string, status: JobStatus, updated_at: string }
 }
 ```
 
-Clients subscribe filtered by their tenant (validated via api_key on connect).
+Each API replica independently LISTENs to `pg_notify('job_status_change')` and broadcasts to its own pool of connected WebSocket clients. No cross-replica coordination needed — every client receives updates regardless of which replica it connected to.
+
+nginx uses `proxy_http_version 1.1` + `Upgrade` / `Connection` headers to correctly proxy WebSocket connections.
 
 ---
 
@@ -316,35 +372,22 @@ const sdk = new NodeSDK({
 sdk.start();
 ```
 
-Do the same in `apps/worker/src/index.ts`.
-
-Add named trace spans for:
-- Job submission (`job.submit`)
-- Job claim (`job.claim`)
-- Job ack (`job.ack`)
-- Job nack (`job.nack`)
-- DLQ promotion (`job.dlq`)
-
-Traces are visible at **http://localhost:16686** (Jaeger UI).
+Named spans: `job.submit`, `job.claim`, `job.ack`, `job.nack`, `job.dlq`
 
 ---
 
-## Dashboard Requirements (apps/dashboard)
+## Dashboard Requirements
 
 **Views:**
-1. **Dashboard (/)** — live stats bar (pending / running / completed / failed counts), job table with status filter tabs, real-time updates via WebSocket
+1. **Dashboard (/)** — MetricsBar (real DB counts via `/jobs/counts`), job table with status filter tabs, real-time updates via WebSocket
 2. **DLQ (/dlq)** — dead letter jobs table with retry button per row
 
-**Components to build:**
-- `MetricsBar` — top strip showing live counts per status
-- `JobTable` — sortable table: ID, payload preview, status badge, attempts, created_at, actions
-- `StatusBadge` — color-coded: pending=gray, running=blue, completed=green, failed=orange, dead_letter=red
-- `SubmitJobForm` — payload textarea, priority slider, idempotency key input, submit button
-- `DLQPanel` — same as JobTable but with Retry action
+**Hooks:**
+- `useJobs(status?)` — fetches job list, exposes `updateJob`, `removeJob`, `hasJob`
+- `useJobCounts()` — fetches `/jobs/counts`, exposes `refetchCounts`
+- `useWebSocket(onMessage)` — connects to WS with exponential backoff reconnection
 
-**Responsive breakpoints:** Mobile-first. Stack layout on mobile, side nav on desktop.
-
-**Real-time:** Use `useWebSocket` hook. On `JOB_UPDATE` message — update job in local state without full refetch.
+**Real-time:** On `JOB_UPDATE` — update job in local state without full refetch. Refetch counts on every WS event.
 
 ---
 
@@ -352,33 +395,61 @@ Traces are visible at **http://localhost:16686** (Jaeger UI).
 
 ```yaml
 services:
-  postgres:    # PostgreSQL 16, run migrations on start
-  api:         # apps/api — port 3000
-  worker:      # apps/worker — scale: 2 replicas
-  dashboard:   # apps/dashboard — port 5173
-  prometheus:  # port 9090, scrapes api:3000/metrics and worker/metrics
-  jaeger:      # port 16686 (UI), 4318 (OTLP HTTP) — free, Apache 2.0
+  nginx:             # Gateway on :80 — LB to api replicas, serves dashboard static files
+  api:               # Fastify API — 2 replicas, no host port (internal only)
+  worker:            # Worker — 2 replicas
+  postgres-primary:  # bitnami/postgresql:16, WAL primary, runs migrations
+  postgres-replica:  # bitnami/postgresql:16, WAL replica (read fallback)
+  redis:             # Redis 7 — rate limiting + caches
+  dashboard:         # React build (static) — served via nginx
+  prometheus:        # :9090, scrapes api replicas + workers
+  jaeger:            # :16686 UI, :4318 OTLP
 ```
 
 ---
 
-## Build Order for Claude Code
+## nginx Gateway Config (docker/nginx/nginx.conf)
 
-Follow this sequence strictly. Do not jump ahead.
+```nginx
+upstream api_backend {
+    server api:3000;          # Docker round-robins across all api replicas
+}
 
-1. `docker-compose.yml` + `docker/prometheus/prometheus.yml`
+server {
+    listen 80;
+
+    # API + WebSocket
+    location / {
+        proxy_pass         http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+    }
+}
+```
+
+Dashboard is built as static files and served directly by nginx (COPY dist into nginx image).
+
+---
+
+## Build Order
+
+1. `docker-compose.yml` + `docker/nginx/nginx.conf` + `docker/prometheus/prometheus.yml`
 2. `packages/shared/src/types.ts`
-3. `apps/api/src/db/` — client, schema SQL, migration runner
-4. `apps/api` — Fastify server skeleton, health endpoint, Pino logger, OTel init
-5. `apps/api/src/middleware/` — auth, rateLimit
-6. `apps/api/src/metrics/prometheus.ts`
-7. `apps/api/src/routes/job.routes.ts` + `job.service.ts` — submit, status, list, cancel
-8. `apps/api/src/routes/dlq.routes.ts` — list DLQ, retry
-9. `apps/api/src/ws/websocket.ts` — WebSocket server + broadcast
-10. `apps/worker/src/` — claimer, leaser, executor, stale lease recovery, worker loop
-11. `apps/dashboard/` — React app, all components, WebSocket hook
-12. Tests — `apps/api/src/__tests__/`, `apps/worker/src/__tests__/`
-13. `README.md` — architecture decisions, trade-offs, how to run
+3. `apps/api/src/db/client.ts` — primary + replica pools
+4. `apps/api/src/cache/` — redis.ts, tenantCache.ts, countsCache.ts
+5. `apps/api` — Fastify skeleton, health, Pino, OTel
+6. `apps/api/src/middleware/` — auth (with Redis tenant cache), rateLimit (Redis sliding window)
+7. `apps/api/src/metrics/prometheus.ts`
+8. `apps/api/src/routes/` — job.routes.ts, dlq.routes.ts
+9. `apps/api/src/ws/websocket.ts`
+10. `apps/worker/src/` — claimer, leaser, executor, stale lease recovery
+11. `apps/dashboard/` — React app, all components, hooks
+12. `apps/e2e/` — Playwright job lifecycle tests
+13. Unit tests — `apps/api/src/__tests__/`, `apps/worker/src/__tests__/`
+14. `README.md`
 
 ---
 
@@ -386,42 +457,40 @@ Follow this sequence strictly. Do not jump ahead.
 
 ### Unit tests (Vitest)
 - `job.service.test.ts` — idempotency key collision, duplicate submission returns original
-- `rateLimit.test.ts` — sliding window correctness, 429 on breach
-- `quota.service.test.ts` — tenant excluded from claim when at concurrency limit
+- `rateLimit.test.ts` — Redis sliding window correctness, 429 on breach
+- `quota.service.test.ts` — tenant excluded when at concurrency limit
 - `claimer.test.ts` — SKIP LOCKED returns null when no eligible jobs
-- `leaser.test.ts` — heartbeat returns false when job stolen; worker aborts
+- `leaser.test.ts` — heartbeat returns false when job stolen
 
-### Concurrency stress test
-- `stress.test.ts` — spawn 10 concurrent workers against 50 jobs, assert zero double-execution (every job completed exactly once)
+### Stress test
+- `stress.test.ts` — 10 concurrent workers × 50 jobs, zero double-execution
 
----
-
-## What NOT To Do
-
-- Do NOT use Prisma or TypeORM — raw `postgres` driver only, so SKIP LOCKED SQL is explicit
-- Do NOT add Redis — not in scope
-- Do NOT add Grafana — not worth the setup for 10% weight
-- Do NOT use Express — Fastify only
-- Do NOT use `any` types in TypeScript — strict mode is on
-- Do NOT put business logic in routes — routes call services, services contain logic
-- Do NOT skip the stale lease recovery loop — it is required for durability correctness
-- Do NOT use `console.log` anywhere — use Pino logger throughout
-- Do NOT hardcode tenant IDs anywhere except seed data
+### Playwright E2E (`apps/e2e/tests/job-lifecycle.spec.ts`)
+Runs against the live stack (`docker compose up`). Covers:
+1. Submit a normal job → appears in table → transitions to completed
+2. Submit a failing job (`{"fail": true}`) → exhausts retries → lands in DLQ
+3. Retry from DLQ → job disappears from DLQ, reappears as pending
+4. Cancel a scheduled (future) job → status becomes failed
+5. MetricsBar counts match `GET /jobs/counts` response
+6. WebSocket delivers real-time status updates without page refresh
 
 ---
 
 ## Environment Variables
 
 ```env
-# apps/api/.env
-DATABASE_URL=postgres://postgres:postgres@postgres:5432/taskqueue
+# apps/api
+DATABASE_URL=postgres://postgres:postgres@postgres-primary:5432/taskqueue
+DATABASE_READ_URL=postgres://postgres:postgres@postgres-replica:5432/taskqueue
+REDIS_URL=redis://redis:6379
 PORT=3000
 NODE_ENV=development
 OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
 OTEL_SERVICE_NAME=task-queue-api
+CORS_ORIGIN=http://localhost:80
 
-# apps/worker/.env
-DATABASE_URL=postgres://postgres:postgres@postgres:5432/taskqueue
+# apps/worker
+DATABASE_URL=postgres://postgres:postgres@postgres-primary:5432/taskqueue
 WORKER_CONCURRENCY=3
 LEASE_DURATION_SECONDS=30
 HEARTBEAT_INTERVAL_SECONDS=10
@@ -430,20 +499,37 @@ POLL_INTERVAL_MS=500
 OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
 OTEL_SERVICE_NAME=task-queue-worker
 
-# apps/dashboard/.env
-VITE_API_URL=http://localhost:3000
-VITE_WS_URL=ws://localhost:3000/ws
+# apps/dashboard
+VITE_API_URL=http://localhost:80
+VITE_WS_URL=ws://localhost:80/ws
 ```
 
 ---
 
-## README Trade-offs to Document
+## What NOT To Do
 
-Address each of these explicitly:
+- Do NOT use Prisma or TypeORM — raw `postgres` driver only
+- Do NOT add Grafana — not in scope
+- Do NOT use Express — Fastify only
+- Do NOT use `any` types — strict mode is on
+- Do NOT put business logic in routes — routes call services
+- Do NOT skip the stale lease recovery loop
+- Do NOT use `console.log` — Pino logger throughout
+- Do NOT hardcode tenant IDs except in seed data
+- Do NOT route workers through nginx — workers are internal consumers, they connect directly to postgres-primary
+- Do NOT cache write results in Redis — only cache reads that are safe to be briefly stale (tenant lookup, counts)
+- Do NOT use separate read pool in workers — workers only do writes (claim/ack/nack/heartbeat)
 
-1. **Why PostgreSQL for the queue instead of Redis/RabbitMQ?** — durability, ACID, simpler ops, SKIP LOCKED is production-proven
-2. **At-least-once vs exactly-once** — this system is at-least-once; idempotency keys are the caller's responsibility for exactly-once semantics
-3. **Lease duration choice (30s)** — balancing redelivery latency vs false-positive reclaims
-4. **In-memory rate limiting trade-off** — works for single API instance; production would need Redis-backed sliding window for multi-instance
-5. **Worker autoscaling design** — describe a trigger: if `jobs_pending_gauge > threshold` for 60s, scale worker replicas; could be implemented via K8s HPA on custom metric
-6. **DLQ strategy** — dead_letter is a status in the same table; in production you'd move to a separate table or topic to avoid index bloat
+---
+
+## Architecture Decisions to Document in README
+
+1. **Why PostgreSQL for the queue** — SKIP LOCKED, ACID, durable, queryable
+2. **At-least-once vs exactly-once** — at-least-once; idempotency keys for exactly-once
+3. **Lease duration (30s)** — balances reclaim latency vs false-positive
+4. **Redis rate limiting** — globally consistent across replicas; single-instance in-memory would allow N×limit bypass
+5. **Redis caching strategy** — tenant auth (hot path, rarely changes), counts (aggregation, 3s TTL); job rows not cached (change too frequently, WS handles real-time)
+6. **Read replica strategy** — all traffic to primary; replica as warm standby for read fallback; WAL is continuous (ms lag), not interval-based
+7. **Worker autoscaling** — `jobs_pending_gauge` as HPA signal; SKIP LOCKED makes adding workers safe at any time
+8. **DLQ strategy** — status in same table; production would use separate table/topic
+9. **nginx WS stickiness** — not needed; each replica independently receives all pg_notify events

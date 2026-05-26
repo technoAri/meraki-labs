@@ -26,7 +26,7 @@ const logger = {
       : undefined,
 };
 
-const app = Fastify({ logger });
+const app = Fastify({ logger, bodyLimit: 65_536 });
 
 const allowedOrigin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
 await app.register(cors, {
@@ -41,8 +41,8 @@ app.register(metricsRoutes);
 app.register(async (instance) => {
   instance.addHook('preHandler', authMiddleware);
   instance.addHook('preHandler', rateLimitMiddleware);
-  instance.register(jobRoutes);
-  instance.register(dlqRoutes);
+  instance.register(jobRoutes, { prefix: '/v1' });
+  instance.register(dlqRoutes, { prefix: '/v1' });
 });
 
 const start = async () => {

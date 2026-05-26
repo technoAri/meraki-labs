@@ -16,6 +16,7 @@
     "@fastify/cors": "^9.0.1",
     "@task-queue/shared": "workspace:*",
     "fastify": "^4.27.0",
+    "ioredis": "^5.4.1",
     "pino": "^9.2.0",
     "pino-pretty": "^11.2.0",
     "postgres": "^3.4.4",

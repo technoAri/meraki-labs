@@ -6,6 +6,9 @@ WORKDIR /app
 COPY package.json pnpm-workspace.yaml ./
 COPY packages/shared/package.json ./packages/shared/
 COPY apps/api/package.json ./apps/api/
+COPY apps/worker/package.json ./apps/worker/
+COPY apps/dashboard/package.json ./apps/dashboard/
+COPY e2e/package.json ./e2e/
 
 RUN pnpm install
 
@@ -22,6 +25,9 @@ WORKDIR /app
 COPY --from=base /app/package.json /app/pnpm-workspace.yaml ./
 COPY --from=base /app/packages/shared/package.json ./packages/shared/
 COPY --from=base /app/apps/api/package.json ./apps/api/
+COPY --from=base /app/apps/worker/package.json ./apps/worker/
+COPY --from=base /app/apps/dashboard/package.json ./apps/dashboard/
+COPY --from=base /app/e2e/package.json ./e2e/
 
 RUN pnpm install --prod
 
