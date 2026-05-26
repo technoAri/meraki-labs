@@ -265,6 +265,7 @@ Open **http://localhost** in a browser. Fully responsive across Desktop, Tablet,
 | Submit Job form | Paste any JSON payload, click Submit |
 | Status tabs | Filter table: all / pending / running / completed / failed / dead_letter |
 | Cancel button | Appears on `pending` rows — cancels immediately |
+| Load more | Bottom of job table and DLQ table — cursor-paginated, 50 rows per page |
 | Dead Letter Queue | Top-right nav link → lists dead-lettered jobs with per-row Retry button |
 | Real-time updates | Table and counts update without page refresh via WebSocket |
 
@@ -879,7 +880,7 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 docker stop meraki-labs-postgres-primary-1
 
 # Reads still work via the WAL replica
-curl -s http://localhost/v1/jobs -H "x-api-key: test-e2e-key-5678" | jq length
+curl -s http://localhost/v1/jobs -H "x-api-key: test-e2e-key-5678" | jq '.data | length'
 
 # Writes fail gracefully (500)
 curl -s -o /dev/null -w "%{http_code}\n" \
