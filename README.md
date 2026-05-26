@@ -1174,3 +1174,13 @@ LIMIT $page_size + 1   -- fetch one extra to detect hasMore without COUNT
 **Why not offset?** Jobs are inserted continuously. With offset pagination, a new job submitted between page 1 and page 2 shifts all rows down by one — the first row of page 2 would be a duplicate of the last row of page 1. Cursor pagination is immune to concurrent inserts because it uses a stable absolute position, not a relative row count.
 
 **The +1 trick:** Fetching `limit + 1` rows lets us detect whether a next page exists without issuing a separate `COUNT(*)` query, which would require a full index scan.
+
+### 14. Hardcoded API keys — dev-only trade-off
+
+The two test API keys (`test-api-key-1234`, `test-e2e-key-5678`) are committed directly in the migration file and baked into the dashboard image at build time. This is intentional for the demo: an evaluator runs `docker compose up --build` and everything works with zero configuration.
+
+In production this would be wrong on two counts:
+- **Secrets in source control** — API keys must come from a secrets manager (AWS Secrets Manager, HashiCorp Vault) or environment-injected at runtime, never committed to the repo
+- **Guessable key format** — real keys should be randomly generated cryptographic tokens (e.g. `openssl rand -hex 32`), not human-readable strings
+
+The production pattern would be: generate keys out-of-band, store them in a secrets manager, inject via environment variables at deploy time, and never let them touch the filesystem or version control.
