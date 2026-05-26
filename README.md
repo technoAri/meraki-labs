@@ -66,7 +66,7 @@ docker compose up --build
 ### Run unit tests (no Docker required)
 
 ```bash
-pnpm install
+pnpm install   # installs on your host machine — only needed for tests
 pnpm test
 ```
 
@@ -74,8 +74,11 @@ pnpm test
 
 ```bash
 docker compose up -d
+pnpm install   # if not already done
 pnpm --filter @task-queue/e2e test
 ```
+
+> **Note on node_modules:** Each Dockerfile runs `pnpm install` inside the build — the services need no `npm install` on your host. You only need `pnpm install` locally if you want to run unit or E2E tests outside Docker.
 
 ---
 
@@ -1017,49 +1020,53 @@ The dashboard bundle is built with `test-e2e-key-5678` (baked in at image build 
 ## Architecture
 
 ```
-                        ┌──────────────────────────────────────────┐
-  Browser / API Client  │              nginx  :80                  │
-        │               │  Round-robin HTTP · WebSocket upgrade     │
-        └──────────────►│  Serves dashboard static files           │
-                        └────────────┬─────────────────────────────┘
-                                     │
-                     ┌───────────────┴───────────────┐
-                     │                               │
-              ┌──────▼──────┐                 ┌──────▼──────┐
-              │   api-1     │                 │   api-2     │
-              │  Fastify    │                 │  Fastify    │
-              └──────┬──────┘                 └──────┬──────┘
-                     │                               │
-                     └───────────┬───────────────────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │         Redis           │
-                    │  rate limiting · cache  │
-                    └─────────────────────────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │   postgres-primary      │  ◄── all reads + writes
-                    └────────────┬────────────┘
-                                 │ WAL stream (continuous, ~ms lag)
-                    ┌────────────▼────────────┐
-                    │   postgres-replica      │  ◄── read fallback if primary fails
-                    └─────────────────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │       Workers           │
-                    │   worker-1   worker-2   │  ◄── SKIP LOCKED claim
-                    └─────────────────────────┘
+  Browser / API Client
+          │
+          ▼
+┌─────────────────────────────────────────────┐
+│                 nginx  :80                  │
+│   Round-robin HTTP · WebSocket upgrade      │
+│   Serves dashboard static files             │
+└───────────────┬─────────────────────────────┘
+                │
+       ┌────────┴─────────┐
+       │                  │
+┌──────▼──────┐    ┌──────▼──────┐
+│   api-1     │    │   api-2     │      ┌─────────────────────┐
+│  Fastify    │    │  Fastify    │      │      Workers        │
+│  WS server  │    │  WS server  │      │  worker-1  worker-2 │
+└──────┬──────┘    └──────┬──────┘      └──────────┬──────────┘
+       │                  │                         │
+       └────────┬─────────┘                         │ (direct — no nginx)
+                │                                   │
+       ┌────────▼────────┐                          │
+       │      Redis      │                          │
+       │  rate limit     │                          │
+       │  tenant cache   │                          │
+       │  counts cache   │                          │
+       └────────┬────────┘                          │
+                │                                   │
+       ┌────────▼──────────────────────────────────▼┐
+       │            postgres-primary                 │
+       │         all reads + writes                  │
+       │  pg_notify ──► api-1 LISTEN                 │
+       │            ──► api-2 LISTEN ──► WS clients  │
+       └────────────────────┬────────────────────────┘
+                            │ WAL stream (continuous, ~ms lag)
+               ┌────────────▼────────────┐
+               │    postgres-replica     │
+               │  read fallback only     │
+               └─────────────────────────┘
 ```
 
 ### Request flow
 
 1. Client hits **nginx :80** — the only exposed entry point
 2. nginx round-robins HTTP requests across **api-1** and **api-2**
-3. Each API replica checks **Redis** for tenant auth cache (avoids DB hit on every request) and enforces rate limits via a Redis sorted-set sliding window
-4. All DB reads and writes go to **postgres-primary**
-5. If postgres-primary is unreachable, read-only queries fall back to **postgres-replica** automatically
-6. **Workers** connect directly to postgres-primary (internal only, not through nginx) and race for jobs via `FOR UPDATE SKIP LOCKED`
-7. On every job status change, workers fire `pg_notify` → both API replicas receive it independently → each broadcasts to their own connected WebSocket clients
+3. Each API replica checks **Redis** for tenant auth (TTL-cached, avoids a DB hit) and enforces rate limits via a Redis sorted-set sliding window
+4. All DB reads and writes go to **postgres-primary**; if it's unreachable, read-only queries fall back to **postgres-replica** automatically
+5. **Workers** connect directly to postgres-primary — they bypass nginx and Redis entirely, connecting straight to the DB and racing for jobs via `FOR UPDATE SKIP LOCKED`
+6. On every job status change, workers fire `pg_notify('job_status_change')` → both API replicas independently LISTEN and receive the event → each broadcasts a `JOB_UPDATE` WebSocket message to its own connected clients
 
 ---
 
