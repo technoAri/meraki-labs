@@ -315,32 +315,121 @@ Traces link the full path from API request → PostgreSQL → worker execution, 
 
 ### Structured logs (Pino)
 
-All services emit JSON logs. View them from any container:
-```bash
-# API logs (pick either replica)
-docker logs meraki-labs-api-1 -f
+#### Viewing logs
 
-# Worker logs
+```bash
+# Follow logs from a specific container
+docker logs meraki-labs-api-1 -f
+docker logs meraki-labs-api-2 -f
 docker logs meraki-labs-worker-1 -f
+docker logs meraki-labs-worker-2 -f
+
+# All services at once
+docker compose logs -f
+
+# Filter to errors only
+docker compose logs -f | grep '"level":50\|ERROR'
+
+# Follow a specific job through the system
+docker compose logs -f | grep '<job-uuid>'
 ```
 
-Every log line is structured JSON. Key fields:
+#### Log formats
 
-| Field | Description |
-|---|---|
-| `level` | `10`=trace, `20`=debug, `30`=info, `40`=warn, `50`=error |
-| `time` | Unix ms timestamp |
-| `jobId` | Present on all job-related events |
-| `tenantId` | Tenant context |
-| `workerId` | Worker instance UUID |
-| `err` | Error object with `message` and `stack` on failures |
-| `reqId` | Request correlation ID (API only, auto-injected by Fastify) |
+**API (development mode — pino-pretty, human-readable):**
+```
+[08:12:10.897] INFO (1): Migrations complete
+[08:12:25.188] INFO (1): incoming request
+    reqId: "req-2"
+    req: {
+      "method": "POST",
+      "url": "/v1/jobs",
+      "hostname": "localhost",
+      "remoteAddress": "172.19.0.12"
+    }
+[08:12:25.214] INFO (1): request completed
+    reqId: "req-2"
+    res: { "statusCode": 201 }
+    responseTime: 25.306
+```
 
-Example log lines:
+**Worker (JSON — one object per line):**
 ```json
-{"level":30,"time":1716825600000,"workerId":"a1b2c3","jobId":"d4e5f6","tenantId":"...","msg":"Claimed job"}
-{"level":30,"time":1716825602000,"workerId":"a1b2c3","jobId":"d4e5f6","msg":"Recovered stale leases","count":1}
-{"level":50,"time":1716825605000,"workerId":"a1b2c3","jobId":"d4e5f6","err":{"message":"Simulated job failure"},"msg":"Unhandled executor error"}
+{"level":30,"time":1716825600000,"pid":1,"hostname":"worker-1","workerId":"6d510e66-...","msg":"Worker started"}
+{"level":30,"time":1716825601000,"pid":1,"hostname":"worker-1","jobId":"d4e5f6-...","tenantId":"6597972f-...","msg":"Claimed job"}
+{"level":30,"time":1716825615000,"pid":1,"hostname":"worker-1","count":1,"msg":"Recovered stale leases"}
+{"level":50,"time":1716825620000,"pid":1,"hostname":"worker-1","jobId":"d4e5f6-...","err":{"type":"Error","message":"Simulated job failure","stack":"Error: Simulated job failure\n    at simulateWork..."},"msg":"Unhandled executor error"}
+```
+
+#### Log level reference
+
+| Level | Value | Used for |
+|---|---|---|
+| `info` | 30 | Normal operations: job claimed, worker started, migrations complete |
+| `warn` | 40 | Degraded but not failing: malformed pg_notify payload |
+| `error` | 50 | Failures requiring attention: executor crash, DB connection failure, startup error |
+
+#### System events and what they mean
+
+| Message | Service | Meaning |
+|---|---|---|
+| `Migrations complete` | api | DB schema is up to date, server is about to start |
+| `Server listening at http://0.0.0.0:3000` | api | API replica is ready |
+| `Worker started` | worker | Worker loop running, includes `workerId` UUID |
+| `Worker metrics server on :9091` | worker | Prometheus scrape endpoint is up |
+| `Claimed job` | worker | Job moved from `pending` to `running`, includes `jobId` and `tenantId` |
+| `Recovered stale leases` | worker | Crashed worker's jobs reclaimed, includes `count` |
+| `Worker stopped` | worker | Graceful shutdown complete (SIGTERM received) |
+| `LISTEN job_status_change failed` | api | Redis pub/sub channel failed — WebSocket updates will stop |
+| `Malformed job_status_change notification` | api | A pg_notify payload couldn't be parsed as JSON |
+
+#### Error log scenarios
+
+**Job executor crash (worker):**
+```json
+{"level":50,"jobId":"...","err":{"message":"Simulated job failure","stack":"..."},"msg":"Unhandled executor error"}
+```
+The job is nacked — either retried or dead-lettered depending on attempt count.
+
+**Worker loop error (worker):**
+```json
+{"level":50,"err":{"message":"connect ECONNREFUSED 10.0.0.5:5432"},"msg":"Worker loop error"}
+```
+Transient DB connectivity failure. The worker continues polling on the next interval.
+
+**Fatal startup error (worker):**
+```json
+{"level":50,"err":{"message":"password authentication failed"},"msg":"Fatal worker error"}
+```
+Process exits. Container restarts per the `restart: unless-stopped` policy.
+
+**API startup failure (api):**
+```
+[ERROR] (1): password authentication failed for user "postgres"
+```
+Process exits with code 1. Container restarts automatically.
+
+**401 Unauthorized (api request log):**
+```
+[WARN] request completed  reqId: "req-5"  res: { "statusCode": 401 }
+```
+
+**429 Rate limited (api request log):**
+```
+[INFO] request completed  reqId: "req-61"  res: { "statusCode": 429 }  responseTime: 1.2
+```
+
+#### Switching to JSON logs in all services
+
+To get raw JSON from the API (e.g. for log aggregation in production), set `NODE_ENV=production` in `docker-compose.yml`:
+```yaml
+environment:
+  NODE_ENV: production   # disables pino-pretty, emits raw JSON
+```
+
+Then pipe through `jq` for readable output:
+```bash
+docker logs meraki-labs-api-1 -f | grep '{"level"' | jq .
 ```
 
 ---
