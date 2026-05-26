@@ -1,8 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { Job, JobStatus } from '@task-queue/shared';
-import { API_KEY } from '../main.js';
-
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000';
+import { API_URL, API_KEY } from '../config.js';
 
 export function useJobs(status?: JobStatus) {
   const [jobs, setJobs] = useState<Job[]>([]);

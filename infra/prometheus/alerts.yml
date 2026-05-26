@@ -1,0 +1,57 @@
+groups:
+  - name: task-queue
+    interval: 15s
+    rules:
+
+      # Dead letter queue is growing — jobs are exhausting all retries
+      - alert: DLQGrowing
+        expr: rate(jobs_dead_lettered_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DLQ is growing for tenant {{ $labels.tenant_id }}"
+          description: "Jobs are being dead-lettered at {{ $value | humanize }}/s. Check worker logs for recurring errors."
+
+      # Queue backlog is building up — workers may not be keeping up
+      - alert: QueueBacklogHigh
+        expr: sum(jobs_pending_gauge) > 20
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job backlog is high ({{ $value }} pending)"
+          description: "More than 20 jobs have been pending for over 2 minutes. Consider scaling workers: docker compose up --scale worker=4"
+
+      # API scrape target is down
+      - alert: APIDown
+        expr: up{job="task-queue-api"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "API is unreachable"
+          description: "Prometheus cannot scrape the API metrics endpoint. The API may be crashed or restarting."
+
+      # Worker scrape target is down
+      - alert: WorkerDown
+        expr: up{job="task-queue-worker"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker is unreachable"
+          description: "Prometheus cannot scrape the worker metrics endpoint. No jobs will be processed until a worker comes back."
+
+      # Job failure rate is much higher than completion rate
+      - alert: HighFailureRate
+        expr: >
+          rate(jobs_failed_total[5m]) > 0
+          and
+          rate(jobs_failed_total[5m]) / (rate(jobs_completed_total[5m]) + rate(jobs_failed_total[5m])) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 50% of jobs are failing for tenant {{ $labels.tenant_id }}"
+          description: "Failure rate: {{ $value | humanizePercentage }}. Check if workers are receiving bad payloads or if a downstream dependency is down."

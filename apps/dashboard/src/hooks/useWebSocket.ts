@@ -1,8 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { WSMessage } from '@task-queue/shared';
-
-const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:3000/ws';
-const API_KEY = import.meta.env.VITE_API_KEY ?? 'test-api-key-1234';
+import { WS_URL, API_KEY } from '../config.js';
 const MAX_BACKOFF_MS = 30_000;
 
 export function useWebSocket(onMessage: (msg: WSMessage) => void): void {

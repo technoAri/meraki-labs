@@ -1,8 +1,15 @@
 import { test, expect } from '@playwright/test';
 
 const API = `${process.env.BASE_URL ?? 'http://localhost'}/v1`;
-const KEY = process.env.API_KEY ?? 'test-api-key-1234';
-const HEADERS = { 'x-api-key': KEY, 'Content-Type': 'application/json' };
+
+// High-throughput tenant (300/min) used for all functional tests — avoids
+// exhausting the rate limit window shared with the rate-limit describe block.
+const E2E_KEY = process.env.E2E_API_KEY ?? 'test-e2e-key-5678';
+const HEADERS = { 'x-api-key': E2E_KEY, 'Content-Type': 'application/json' };
+
+// 60/min tenant used exclusively in the "Rate limiting" describe block.
+const RATE_KEY = process.env.API_KEY ?? 'test-api-key-1234';
+const RATE_HEADERS = { 'x-api-key': RATE_KEY, 'Content-Type': 'application/json' };
 
 // ─── API-level helpers using Playwright request context ─────────────────────
 
@@ -158,6 +165,23 @@ test.describe('Infrastructure', () => {
 
 test.describe('Dashboard UI', () => {
 
+  // Wait for rate-limit window to have headroom before browser-driven tests.
+  // Browser page loads trigger several GET /jobs and GET /jobs/counts calls that
+  // count against the same tenant window as the API tests above.
+  test.beforeAll(async () => {
+    test.setTimeout(300_000);
+    for (let successes = 0; successes < 5; ) {
+      const probe = await fetch(`${API}/jobs`, { headers: HEADERS });
+      if (probe.status === 429) {
+        const body = await probe.json() as { retryAfter?: number };
+        await new Promise((res) => setTimeout(res, ((body.retryAfter ?? 60) + 2) * 1000));
+        successes = 0;
+      } else {
+        successes++;
+      }
+    }
+  });
+
   test('9. Dashboard loads and shows MetricsBar', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByText('Task Queue')).toBeVisible();
@@ -188,6 +212,10 @@ test.describe('Dashboard UI', () => {
   });
 
   test('12. DLQ retry — job disappears and stays gone (retry strips fail flag, job completes)', async ({ page, request }) => {
+    // This test may need to wait out a rate-limit window (up to ~60s) before the
+    // dead_letter poll resolves, so override the default 60s per-test timeout.
+    test.setTimeout(300_000);
+
     // Create a fail:true job that will dead-letter after exactly one attempt
     const createRes = await request.post(`${API}/jobs`, {
       headers: HEADERS,
@@ -196,11 +224,18 @@ test.describe('Dashboard UI', () => {
     expect(createRes.status()).toBe(201);
     const job = await createRes.json() as { id: string };
 
-    // Wait for it to land in dead_letter
+    // Wait for it to land in dead_letter.
+    // Handles 429 gracefully: when rate-limited, sleep for retryAfter seconds and
+    // return a sentinel so the poll continues rather than silently timing out on undefined.
     await expect.poll(async () => {
       const r = await request.get(`${API}/jobs/${job.id}`, { headers: HEADERS });
+      if (r.status() === 429) {
+        const body = await r.json() as { retryAfter?: number };
+        await new Promise((res) => setTimeout(res, ((body.retryAfter ?? 10) + 1) * 1000));
+        return 'rate_limited';
+      }
       return (await r.json() as { status: string }).status;
-    }, { timeout: 20_000, intervals: [500] }).toBe('dead_letter');
+    }, { timeout: 90_000, intervals: [1000] }).toBe('dead_letter');
 
     // Navigate to DLQ via client-side routing (direct page.goto('/dlq') bypasses React Router)
     await page.goto('/');
@@ -211,7 +246,7 @@ test.describe('Dashboard UI', () => {
     // Target the specific row by UUID prefix — first 8 chars are visible in the truncated display
     const idPrefix = job.id.slice(0, 8);
     const jobRow = page.locator('tbody tr').filter({ hasText: idPrefix });
-    await expect(jobRow).toBeVisible({ timeout: 5_000 });
+    await expect(jobRow).toBeVisible({ timeout: 10_000 });
 
     // Click Retry — the row must vanish WITHOUT page.reload() (driven by WebSocket 'pending' event)
     await jobRow.getByRole('button', { name: 'Retry' }).click();
@@ -221,8 +256,13 @@ test.describe('Dashboard UI', () => {
     // The worker succeeds and moves the job to 'completed' — it must NOT reappear in the DLQ.
     await expect.poll(async () => {
       const r = await request.get(`${API}/jobs/${job.id}`, { headers: HEADERS });
+      if (r.status() === 429) {
+        const body = await r.json() as { retryAfter?: number };
+        await new Promise((res) => setTimeout(res, ((body.retryAfter ?? 10) + 1) * 1000));
+        return 'rate_limited';
+      }
       return (await r.json() as { status: string }).status;
-    }, { timeout: 15_000, intervals: [500] }).toBe('completed');
+    }, { timeout: 90_000, intervals: [1000] }).toBe('completed');
 
     // Confirm the row stays absent from the DLQ table
     await expect(page.locator('tbody tr').filter({ hasText: idPrefix })).not.toBeVisible();
@@ -257,10 +297,11 @@ test.describe('Dashboard UI', () => {
 test.describe('Rate limiting', () => {
 
   test('13. Rate limit returns 429 after limit exceeded', async ({ request }) => {
-    // Tenant limit is 60/min; send 80 to reliably exceed it even accounting for
-    // requests already made in earlier tests within the same 60s window.
+    // Uses the 60/min tenant (RATE_HEADERS) isolated from the functional test tenant,
+    // so functional tests never interfere with this window. Send 80 to reliably
+    // exceed the 60/min limit in a single burst.
     const requests = Array.from({ length: 80 }, () =>
-      request.get(`${API}/jobs`, { headers: HEADERS })
+      request.get(`${API}/jobs`, { headers: RATE_HEADERS })
     );
     const responses = await Promise.all(requests);
     const statuses = responses.map((r) => r.status());

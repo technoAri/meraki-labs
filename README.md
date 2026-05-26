@@ -85,7 +85,7 @@ pnpm --filter @task-queue/e2e test
 |---|---|---|
 | `nginx` | Single entry point — proxies API, serves dashboard static files | **:80** |
 | `api` (×2) | Fastify REST API + WebSocket | internal :3000 (no host port) |
-| `worker` (×2) | Job executor (SKIP LOCKED claim loop) | none |
+| `worker` (×2) | Job executor (SKIP LOCKED claim loop) — each process handles up to 3 concurrent jobs (`WORKER_CONCURRENCY=3`), so 2 workers = 6 jobs in-flight max | none |
 | `postgres-primary` | Primary DB — all reads + writes | none (internal) |
 | `postgres-replica` | WAL replica — read fallback | none (internal) |
 | `redis` | Rate limiting + tenant auth cache + counts cache | none (internal) |
@@ -263,55 +263,157 @@ curl http://localhost/health
 # → {"status":"ok"}
 ```
 
-### Prometheus metrics
+---
 
-Open **http://localhost:9091** to browse the Prometheus UI and run queries.
+### Prometheus — metrics & alerts
 
-Metrics are also directly scrapeable:
-```bash
-curl http://localhost/metrics
+**Open: http://localhost:9091**
+
+Prometheus is a time-series metrics store. It scrapes both the API and worker every 15 seconds and lets you query the history with PromQL expressions.
+
+#### Navigating the UI
+
+| Tab | What it does |
+|---|---|
+| **Graph** | Type a PromQL query and see the result as a number or chart. Start here. |
+| **Alerts** | Shows all configured alert rules and their current state: `inactive` (not firing), `pending` (condition met, waiting), or `firing` (problem confirmed). |
+| **Status → Targets** | Shows whether Prometheus can reach the API and worker scrape endpoints. If a row shows `DOWN`, that service is unreachable. |
+| **Status → Rules** | Lists all loaded alert rules with their last evaluation result. |
+
+#### First thing to try
+
+1. Go to **http://localhost:9091/graph**
+2. Paste this query and press **Execute**:
 ```
+sum(jobs_pending_gauge)
+```
+This shows the true pending queue depth (submits happen in the API, claims in the worker — `sum` combines both). Switch to the **Graph** tab to watch it over time as you submit jobs.
 
-| Metric | Type | Labels | Description |
+#### Metrics
+
+| Metric | Source | Type | Description |
 |---|---|---|---|
-| `jobs_submitted_total` | Counter | `tenant_id` | Total jobs submitted |
-| `jobs_completed_total` | Counter | `tenant_id` | Successfully completed jobs |
-| `jobs_failed_total` | Counter | `tenant_id` | Failed job attempts (includes retries) |
-| `jobs_dead_lettered_total` | Counter | `tenant_id` | Jobs that exhausted all retries |
-| `jobs_pending_gauge` | Gauge | `tenant_id` | Currently pending jobs |
-| `jobs_running_gauge` | Gauge | `tenant_id` | Currently running jobs |
-| `job_processing_duration_ms` | Histogram | `tenant_id` | End-to-end processing time per job |
-| `worker_lease_renewals_total` | Counter | `worker_id` | Heartbeat renewals per worker (confirms workers are alive) |
+| `jobs_submitted_total` | api | Counter | Total jobs received via POST /jobs |
+| `jobs_pending_gauge` | api + worker | Gauge | Queue depth delta — api tracks +1 submit / -1 cancel, worker tracks -1 on claim. Use `sum()` for the true total. |
+| `jobs_completed_total` | worker | Counter | Successfully completed jobs |
+| `jobs_failed_total` | worker | Counter | Failed attempts (includes retries before DLQ) |
+| `jobs_dead_lettered_total` | worker | Counter | Jobs that exhausted all retries |
+| `jobs_running_gauge` | worker | Gauge | Currently executing jobs |
+| `job_processing_duration_ms` | worker | Histogram | End-to-end latency per job |
+| `worker_lease_renewals_total` | worker | Counter | Heartbeat renewals — confirms workers are alive |
 
-**Key queries to try in Prometheus:**
+#### Useful queries
+
 ```
-# Job throughput rate (last 5 minutes)
+# Current pending queue depth
+sum(jobs_pending_gauge)
+
+# Job throughput — completions per second (last 5 min)
 rate(jobs_completed_total[5m])
 
-# DLQ growth rate
+# DLQ growth rate — should stay at 0 in a healthy system
 rate(jobs_dead_lettered_total[5m])
 
-# Current queue depth (autoscaling signal)
-jobs_pending_gauge
+# Are workers alive? Heartbeat renewals confirm the lease loop is running
+rate(worker_lease_renewals_total[1m])
 ```
 
-### Jaeger distributed traces
+#### Alert rules
 
-Open **http://localhost:16687** → select service `task-queue-api` or `task-queue-worker` → Search.
+Five alert rules are pre-configured in `infra/prometheus/alerts.yml`. Open **http://localhost:9091/alerts** to see their current state:
 
-Every job operation emits a trace with named spans:
-
-| Span | Service | Description |
+| Alert | Fires when | Severity |
 |---|---|---|
-| `job.submit` | api | Full submit path including idempotency check |
-| `job.claim` | worker | SKIP LOCKED claim attempt |
-| `job.execute` | worker | Actual job execution |
-| `job.ack` | worker | Mark completed |
-| `job.nack` | worker | Mark failed / retry / dead_letter |
-| `job.lease_renew` | worker | Heartbeat renewal |
-| `job.dlq` | worker | Dead-letter event |
+| `DLQGrowing` | DLQ growth rate > 0 for 1 minute | warning |
+| `QueueBacklogHigh` | Pending queue > 20 jobs for 2 minutes | warning |
+| `HighFailureRate` | >50% of job attempts failing for 2 minutes | warning |
+| `APIDown` | API scrape target unreachable for 30 seconds | critical |
+| `WorkerDown` | Worker scrape target unreachable for 30 seconds | critical |
 
-Traces link the full path from API request → PostgreSQL → worker execution, making it straightforward to debug slow or failed jobs.
+**How to trigger an alert to see it fire:**
+```bash
+# Trigger DLQGrowing — submit 3 failing jobs (max_attempts=1 so they DLQ immediately)
+for i in 1 2 3; do
+  curl -s -X POST http://localhost/v1/jobs \
+    -H "x-api-key: test-e2e-key-5678" \
+    -H "Content-Type: application/json" \
+    -d '{"payload": {"fail": true}, "max_attempts": 1}'
+done
+# Wait ~60s, then refresh http://localhost:9091/alerts — DLQGrowing moves to FIRING
+```
+
+**Alert states explained:**
+- `inactive` — rule is evaluated, condition is false (normal)
+- `pending` — condition is true but hasn't lasted long enough yet (the `for` duration)
+- `firing` — condition has been true long enough, alert is confirmed
+
+> In production, alerts route through [Alertmanager](https://prometheus.io/docs/alerting/latest/alertmanager/) to Slack, PagerDuty, or email. Here they're visible in the UI only — no Alertmanager is configured since this is a self-contained demo.
+
+---
+
+### Jaeger — distributed traces
+
+**Open: http://localhost:16687**
+
+Jaeger records the exact execution path of individual operations — every DB query, every function call — with precise timings. Where Prometheus tells you *how many* jobs failed, Jaeger tells you *why a specific job* failed and *where* time was spent.
+
+#### Navigating the UI
+
+Select a service from the left panel dropdown and click **Find Traces**:
+- `task-queue-api` — traces for job submissions, status checks, DLQ operations
+- `task-queue-worker` — traces for job claims, execution, ack/nack, heartbeats
+
+Click any result row to open a timeline of nested spans with per-span timings.
+
+#### First thing to try
+
+1. Submit a job:
+```bash
+curl -s -X POST http://localhost/v1/jobs \
+  -H "x-api-key: test-e2e-key-5678" \
+  -H "Content-Type: application/json" \
+  -d '{"payload": {"task": "hello"}}'
+```
+2. Go to **http://localhost:16687**, select `task-queue-api`, click **Find Traces**
+3. Click the `job.submit` trace — you see the full submit path with DB timing
+
+#### What each span means
+
+| Span | Service | What you see inside |
+|---|---|---|
+| `job.submit` | api | Idempotency check + INSERT — total time from request to DB commit |
+| `job.claim` | worker | SKIP LOCKED UPDATE — how long it took to claim a pending job |
+| `job.execute` | worker | Actual execution time — how long the job's work took |
+| `job.ack` | worker | UPDATE to `completed` — DB write after successful execution |
+| `job.nack` | worker | UPDATE to `pending` or `dead_letter` — DB write after failure |
+| `job.lease_renew` | worker | Heartbeat UPDATE — confirms the worker is still alive |
+| `job.dlq` | worker | Child span inside `job.nack` — only appears when a job is dead-lettered |
+
+#### Reading a trace
+
+A typical successful job produces this span tree in the worker:
+```
+job.claim       (e.g. 3ms  — claim from DB)
+job.execute     (e.g. 250ms — simulated work)
+  job.ack       (e.g. 2ms  — write completed status)
+```
+
+A failed job that retries looks like:
+```
+job.claim       (3ms)
+job.execute     (150ms)
+  job.nack      (2ms)   ← status set back to 'pending'
+```
+
+A job that exhausts retries and dead-letters:
+```
+job.claim       (3ms)
+job.execute     (150ms)
+  job.nack      (2ms)
+    job.dlq     (0ms)   ← child span marking the DLQ event
+```
+
+If a span is unexpectedly long, that's where to look first — it will be visually wider in the timeline.
 
 ### Structured logs (Pino)
 
@@ -325,8 +427,12 @@ The API runs with `NODE_ENV=development` so logs are formatted by pino-pretty �
 
 **How to view:**
 ```bash
+# Docker Compose auto-names replicas as <project>-<service>-<n>
 docker logs meraki-labs-api-1 -f
 docker logs meraki-labs-api-2 -f
+
+# Or follow all API replicas at once without naming them individually
+docker compose logs api -f
 ```
 
 **What you see:**
@@ -369,11 +475,14 @@ The worker emits raw Pino JSON — one object per line.
 
 **How to view:**
 ```bash
-# Raw JSON
+# Raw JSON (container names are auto-generated by Docker Compose)
 docker logs meraki-labs-worker-1 -f
 
+# Or follow all worker replicas at once
+docker compose logs worker -f
+
 # Readable with jq (requires jq installed)
-docker logs meraki-labs-worker-1 -f | jq .
+docker compose logs worker -f | jq .
 ```
 
 **What you see:**
@@ -406,15 +515,14 @@ System logs are `info`-level events that confirm the lifecycle of each service. 
 
 **How to monitor system events in real time:**
 ```bash
-# Watch all system events across both workers
-docker logs meraki-labs-worker-1 -f | jq 'select(.level == 30)'
-docker logs meraki-labs-worker-2 -f | jq 'select(.level == 30)'
+# Watch all system events across all worker replicas
+docker compose logs worker -f | grep "Claimed job\|Recovered\|started\|stopped"
 
 # Watch only stale lease recovery (indicates a worker crashed)
-docker compose logs -f worker | grep "Recovered stale leases"
+docker compose logs worker -f | grep "Recovered stale leases"
 
-# Count how many jobs each worker has claimed (since container start)
-docker logs meraki-labs-worker-1 2>&1 | grep -c "Claimed job"
+# Count how many jobs have been claimed across all workers (since container start)
+docker compose logs worker | grep -c "Claimed job"
 ```
 
 ---
@@ -425,14 +533,14 @@ Error logs are `error`-level (`"level":50` in JSON, `ERROR` in pino-pretty). Eve
 
 **How to monitor errors across all services:**
 ```bash
-# All errors in real time (works for both log formats)
+# All errors in real time across every container
 docker compose logs -f | grep -E '"level":50|ERROR'
 
-# Worker errors only (with jq for clean output)
-docker logs meraki-labs-worker-1 -f | jq 'select(.level == 50)'
+# Worker errors only with jq (all replicas)
+docker compose logs worker -f | jq 'select(.level == 50)'
 
-# API errors (grep the pino-pretty ERROR line and 2 lines of context)
-docker logs meraki-labs-api-1 -f 2>&1 | grep -A2 "ERROR"
+# API errors only (pino-pretty ERROR lines with context)
+docker compose logs api -f | grep -A2 "ERROR"
 ```
 
 **Implemented error events:**
@@ -620,6 +728,191 @@ WHERE id = $1 AND status = 'dead_letter'
 
 ---
 
+## Reproducing Edge Cases
+
+All scenarios below run against a live stack (`docker compose up`). Open a second terminal and run `docker compose logs -f` to watch events as they happen. Commands use `test-e2e-key-5678` (300/min limit) unless the scenario is specifically about rate limiting.
+
+---
+
+### 1. Worker crash mid-job
+
+```bash
+# Terminal 1 — watch for stale lease recovery
+docker compose logs worker -f | grep "Recovered stale leases"
+
+# Terminal 2 — submit a job, then immediately kill one worker
+curl -s -X POST http://localhost/v1/jobs \
+  -H "x-api-key: test-e2e-key-5678" \
+  -H "Content-Type: application/json" \
+  -d '{"payload": {"task": "important-work"}}' | jq .id
+
+docker kill meraki-labs-worker-1
+```
+
+Within ≤45 seconds the surviving worker logs `"Recovered stale leases"` with `"count":1` and reclaims the job.
+
+---
+
+### 2 & 3. Lease theft / SKIP LOCKED race
+
+These are verified by unit and stress tests rather than a manual trigger:
+- **Lease theft** — `leaser.test.ts`: `renewLease` returns `false` when `worker_id` no longer matches, causing the original worker to abort.
+- **SKIP LOCKED race** — `stress.test.ts`: 10 concurrent workers × 50 jobs with zero double-execution confirmed.
+
+---
+
+### 4. Idempotency key collision
+
+```bash
+# Submit twice with the same idempotency_key
+for i in 1 2; do
+  curl -s -X POST http://localhost/v1/jobs \
+    -H "x-api-key: test-e2e-key-5678" \
+    -H "Content-Type: application/json" \
+    -d '{"payload": {"task": "send-invoice"}, "idempotency_key": "invoice-order-99"}' | jq .id
+done
+# Both lines print the same UUID
+```
+
+---
+
+### 5. Rate limit exceeded
+
+```bash
+# Send 65 requests against the 60/min tenant
+for i in $(seq 1 65); do
+  curl -s -o /dev/null -w "%{http_code}\n" \
+    http://localhost/v1/jobs/counts \
+    -H "x-api-key: test-api-key-1234"
+done
+# First 60 → 200, remainder → 429 with {"error":"Rate limit exceeded","retryAfter":...}
+```
+
+---
+
+### 6. Per-tenant concurrency cap
+
+```bash
+# Submit 6 jobs in parallel against the 5-concurrent tenant (test-api-key-1234)
+for i in $(seq 1 6); do
+  curl -s -X POST http://localhost/v1/jobs \
+    -H "x-api-key: test-api-key-1234" \
+    -H "Content-Type: application/json" \
+    -d "{\"payload\": {\"task\": \"job-$i\"}}" &
+done
+wait
+
+# Immediately query DB — 5 running, 1 still pending
+docker exec meraki-labs-postgres-primary-1 psql -U postgres -d taskqueue \
+  -c "SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status;"
+```
+
+The 6th job stays `pending` until one of the 5 running jobs completes.
+
+---
+
+### 7. Scheduled job claimed early
+
+```bash
+# Submit with a far-future scheduled_at
+curl -s -X POST http://localhost/v1/jobs \
+  -H "x-api-key: test-e2e-key-5678" \
+  -H "Content-Type: application/json" \
+  -d '{"payload": {"task": "future-report"}, "scheduled_at": "2099-01-01T00:00:00Z"}' | jq .
+
+# Verify it stays pending indefinitely (scheduled_at is in 2099)
+curl -s "http://localhost/v1/jobs?status=pending" \
+  -H "x-api-key: test-e2e-key-5678" | jq '.[0] | {id, status, scheduled_at}'
+```
+
+---
+
+### 8. Cancel on non-pending job
+
+```bash
+# Submit and capture the job ID
+ID=$(curl -s -X POST http://localhost/v1/jobs \
+  -H "x-api-key: test-e2e-key-5678" \
+  -H "Content-Type: application/json" \
+  -d '{"payload": {"task": "quick"}}' | jq -r .id)
+
+# Wait for it to complete
+sleep 3
+
+# Try to cancel a completed job
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -X POST "http://localhost/v1/jobs/$ID/cancel" \
+  -H "x-api-key: test-e2e-key-5678"
+# → 404 (WHERE status = 'pending' matched nothing)
+```
+
+---
+
+### 9. PostgreSQL primary failure
+
+```bash
+# Stop the primary
+docker stop meraki-labs-postgres-primary-1
+
+# Reads still work via the WAL replica
+curl -s http://localhost/v1/jobs -H "x-api-key: test-e2e-key-5678" | jq length
+
+# Writes fail gracefully (500)
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -X POST http://localhost/v1/jobs \
+  -H "x-api-key: test-e2e-key-5678" \
+  -H "Content-Type: application/json" \
+  -d '{"payload": {"task": "test"}}'
+
+# Restore — all services resume automatically, no data lost
+docker start meraki-labs-postgres-primary-1
+```
+
+---
+
+### 10. DLQ and retry
+
+```bash
+# Submit a job that will exhaust its retries
+JOB=$(curl -s -X POST http://localhost/v1/jobs \
+  -H "x-api-key: test-e2e-key-5678" \
+  -H "Content-Type: application/json" \
+  -d '{"payload": {"fail": true}, "max_attempts": 2}')
+ID=$(echo $JOB | jq -r .id)
+
+# Wait for dead_letter (~10s for 2 failed attempts)
+sleep 12
+curl -s "http://localhost/v1/jobs/$ID" -H "x-api-key: test-e2e-key-5678" | jq .status
+# → "dead_letter"
+
+# Retry — strips the fail flag, resets attempts to 0
+curl -s -X POST "http://localhost/v1/dlq/$ID/retry" \
+  -H "x-api-key: test-e2e-key-5678" | jq .
+
+# Job completes successfully this time
+sleep 3
+curl -s "http://localhost/v1/jobs/$ID" -H "x-api-key: test-e2e-key-5678" | jq .status
+# → "completed"
+```
+
+---
+
+### 11. Graceful worker shutdown
+
+```bash
+# Terminal 1 — watch for clean shutdown message
+docker compose logs worker -f | grep "Worker stopped\|Recovered"
+
+# Terminal 2 — stop all workers (sends SIGTERM)
+docker compose stop worker
+# Logs show: {"msg":"Worker stopped"} per replica — no crash, no abrupt exit
+
+# Restart workers — they resume immediately
+docker compose up -d worker
+```
+
+---
+
 ## Inspect the Database
 
 ```bash
@@ -667,6 +960,17 @@ pnpm test
 docker compose up -d
 pnpm --filter @task-queue/e2e test
 ```
+
+### Test API keys
+
+Two tenants are seeded automatically on first `docker compose up`:
+
+| Key | Rate limit | Used by |
+|---|---|---|
+| `test-e2e-key-5678` | 300/min | All functional E2E tests + dashboard UI |
+| `test-api-key-1234` | 60/min | Rate-limiting test only |
+
+The dashboard bundle is built with `test-e2e-key-5678` (baked in at image build time via `VITE_API_KEY`). Playwright's `extraHTTPHeaders` uses the same key so browser-level fetch calls and API-level test requests authenticate as the same tenant. The rate-limit test uses `test-api-key-1234` in isolation so its 60/min window is never depleted by the rest of the suite.
 
 ### What the E2E suite covers
 
@@ -782,6 +1086,21 @@ A common misconception is that WebSocket connections require sticky sessions whe
 ### 9. Worker autoscaling design
 
 `jobs_pending_gauge` is the natural autoscaling signal. A Kubernetes HPA with a custom metrics adapter could scale worker replicas when `jobs_pending_gauge > threshold` for 60+ seconds. The SKIP LOCKED design makes adding workers safe at any time — new workers immediately join the claim race without coordination or configuration changes.
+
+To demonstrate horizontal scaling locally:
+
+```bash
+# Scale up to 4 workers — they join the claim race immediately
+docker compose up --scale worker=4 -d
+
+# Watch all four workers claiming jobs in real time
+docker compose logs worker -f | grep "Claimed job"
+
+# Scale back down safely — SIGTERM triggers graceful shutdown
+docker compose up --scale worker=1 -d
+```
+
+No configuration changes, no coordination protocol, no downtime. This is the same model Kubernetes uses — the HPA just automates the `--scale` decision based on `jobs_pending_gauge`.
 
 ### 10. Per-tenant concurrency — why not a message broker?
 

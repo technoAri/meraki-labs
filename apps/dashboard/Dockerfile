@@ -17,7 +17,7 @@ COPY apps/dashboard ./apps/dashboard
 
 ARG VITE_API_URL=http://localhost/v1
 ARG VITE_WS_URL=ws://localhost/ws
-ARG VITE_API_KEY=test-api-key-1234
+ARG VITE_API_KEY=test-e2e-key-5678
 
 ENV VITE_API_URL=$VITE_API_URL
 ENV VITE_WS_URL=$VITE_WS_URL

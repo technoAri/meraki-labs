@@ -7,9 +7,7 @@ import { useWebSocket } from '../hooks/useWebSocket.js';
 import { MetricsBar } from '../components/MetricsBar.js';
 import { JobTable } from '../components/JobTable.js';
 import { SubmitJobForm } from '../components/SubmitJobForm.js';
-import { API_KEY } from '../main.js';
-
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000';
+import { API_URL, API_KEY } from '../config.js';
 
 const STATUS_TABS = ['all', 'pending', 'running', 'completed', 'failed', 'dead_letter'] as const;
 type TabValue = typeof STATUS_TABS[number];

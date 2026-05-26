@@ -28,7 +28,7 @@ const logger = {
 
 const app = Fastify({ logger, bodyLimit: 65_536 });
 
-const allowedOrigin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
+const allowedOrigin = process.env.CORS_ORIGIN ?? 'http://localhost';
 await app.register(cors, {
   origin: allowedOrigin,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],

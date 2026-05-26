@@ -41,6 +41,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_expiry
   ON jobs (lease_expires_at)
   WHERE status = 'running';
 
+-- Primary test tenant — rate-limit test uses this key (60/min matches the test assertion)
 INSERT INTO tenants (name, api_key, rate_limit_per_minute, max_concurrent_jobs)
 VALUES ('test-tenant', 'test-api-key-1234', 60, 5)
+ON CONFLICT (api_key) DO NOTHING;
+
+-- High-throughput tenant for E2E functional tests — avoids rate-limit interference
+INSERT INTO tenants (name, api_key, rate_limit_per_minute, max_concurrent_jobs)
+VALUES ('test-tenant-e2e', 'test-e2e-key-5678', 300, 20)
 ON CONFLICT (api_key) DO NOTHING;

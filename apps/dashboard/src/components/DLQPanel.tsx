@@ -1,8 +1,6 @@
 import { useState, Fragment } from 'react';
 import type { Job } from '@task-queue/shared';
-import { API_KEY } from '../main.js';
-
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000';
+import { API_URL, API_KEY } from '../config.js';
 
 interface Props {
   jobs: Job[];
