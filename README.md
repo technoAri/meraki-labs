@@ -964,6 +964,8 @@ docker compose up -d postgres-primary
 
 ## Running Tests
 
+> **Prerequisites for tests:** Node.js 20+ and pnpm (`npm install -g pnpm`) must be installed on your host. Docker is not needed for unit tests.
+
 ```bash
 # Unit tests (Vitest — no Docker required)
 pnpm install
