@@ -6,9 +6,12 @@ interface Props {
   jobs: Job[];
   onCancel?: (id: string) => void;
   filterStatus?: JobStatus | 'all';
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
 }
 
-export function JobTable({ jobs, onCancel, filterStatus = 'all' }: Props) {
+export function JobTable({ jobs, onCancel, filterStatus = 'all', hasMore, loadingMore, onLoadMore }: Props) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const filtered = filterStatus === 'all' ? jobs : jobs.filter((j) => j.status === filterStatus);
 
@@ -92,6 +95,17 @@ export function JobTable({ jobs, onCancel, filterStatus = 'all' }: Props) {
           ))}
         </tbody>
       </table>
+      {hasMore && (
+        <div className="px-4 py-3 border-t border-gray-200 text-center">
+          <button
+            onClick={onLoadMore}
+            disabled={loadingMore}
+            className="text-sm text-blue-600 hover:text-blue-800 font-medium disabled:opacity-50"
+          >
+            {loadingMore ? 'Loading…' : 'Load more'}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

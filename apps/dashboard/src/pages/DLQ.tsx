@@ -5,7 +5,7 @@ import { useWebSocket } from '../hooks/useWebSocket.js';
 import { DLQPanel } from '../components/DLQPanel.js';
 
 export default function DLQ() {
-  const { jobs, loading, error, refetch, removeJob } = useJobs('dead_letter');
+  const { jobs, loading, loadingMore, error, hasMore, refetch, loadMore, removeJob } = useJobs('dead_letter');
 
   useWebSocket((msg: WSMessage) => {
     if (msg.type === 'JOB_UPDATE') {
@@ -40,7 +40,13 @@ export default function DLQ() {
           {loading ? (
             <div className="px-4 py-8 text-center text-gray-400 text-sm">Loading…</div>
           ) : (
-            <DLQPanel jobs={jobs} onRetried={() => void refetch()} />
+            <DLQPanel
+              jobs={jobs}
+              onRetried={() => void refetch()}
+              hasMore={hasMore}
+              loadingMore={loadingMore}
+              onLoadMore={loadMore}
+            />
           )}
         </div>
       </div>

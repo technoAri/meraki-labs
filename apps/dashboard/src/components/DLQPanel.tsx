@@ -5,9 +5,12 @@ import { API_URL, API_KEY } from '../config.js';
 interface Props {
   jobs: Job[];
   onRetried: () => void;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
 }
 
-export function DLQPanel({ jobs, onRetried }: Props) {
+export function DLQPanel({ jobs, onRetried, hasMore, loadingMore, onLoadMore }: Props) {
   const [retryingId, setRetryingId] = useState<string | null>(null);
   const [retryError, setRetryError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -111,6 +114,17 @@ export function DLQPanel({ jobs, onRetried }: Props) {
           </tbody>
         </table>
       </div>
+      {hasMore && (
+        <div className="px-4 py-3 border-t border-gray-200 text-center">
+          <button
+            onClick={onLoadMore}
+            disabled={loadingMore}
+            className="text-sm text-blue-600 hover:text-blue-800 font-medium disabled:opacity-50"
+          >
+            {loadingMore ? 'Loading…' : 'Load more'}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

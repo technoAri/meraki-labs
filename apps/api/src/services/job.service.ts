@@ -61,21 +61,53 @@ export async function getJob(jobId: string, tenantId: string): Promise<Job | nul
   return rows[0] ?? null;
 }
 
-export async function listJobs(tenantId: string, status?: JobStatus): Promise<Job[]> {
-  if (status) {
-    return readWithFallback((db) => db<Job[]>`
-      SELECT * FROM jobs
-      WHERE tenant_id = ${tenantId} AND status = ${status}
-      ORDER BY created_at DESC
-      LIMIT 100
-    `);
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 200;
+
+function encodeCursor(job: Job): string {
+  return Buffer.from(JSON.stringify({ ts: job.created_at, id: job.id })).toString('base64url');
+}
+
+function decodeCursor(raw: string): { ts: string; id: string } | null {
+  try {
+    return JSON.parse(Buffer.from(raw, 'base64url').toString()) as { ts: string; id: string };
+  } catch {
+    return null;
   }
-  return readWithFallback((db) => db<Job[]>`
-    SELECT * FROM jobs
-    WHERE tenant_id = ${tenantId}
-    ORDER BY created_at DESC
-    LIMIT 100
-  `);
+}
+
+export interface PagedJobs {
+  data: Job[];
+  nextCursor: string | null;
+}
+
+export async function listJobs(
+  tenantId: string,
+  status?: JobStatus,
+  cursor?: string,
+  limit?: number,
+): Promise<PagedJobs> {
+  const pageSize = Math.min(limit ?? DEFAULT_LIMIT, MAX_LIMIT);
+  const decoded = cursor ? decodeCursor(cursor) : null;
+
+  const rows = await readWithFallback((db) => {
+    const statusFilter = status ? db`AND status = ${status}` : db``;
+    const cursorFilter = decoded
+      ? db`AND (created_at < ${decoded.ts}::timestamptz OR (created_at = ${decoded.ts}::timestamptz AND id::text < ${decoded.id}))`
+      : db``;
+    return db<Job[]>`
+      SELECT * FROM jobs
+      WHERE tenant_id = ${tenantId}
+      ${statusFilter}
+      ${cursorFilter}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ${pageSize + 1}
+    `;
+  });
+
+  const hasMore = rows.length > pageSize;
+  const data = hasMore ? rows.slice(0, pageSize) : rows;
+  return { data, nextCursor: hasMore ? encodeCursor(data[data.length - 1]) : null };
 }
 
 export type JobCounts = CachedCounts;

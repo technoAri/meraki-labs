@@ -15,7 +15,7 @@ type TabValue = typeof STATUS_TABS[number];
 export default function Dashboard() {
   const [activeTab, setActiveTab] = useState<TabValue>('all');
   const [cancelError, setCancelError] = useState<string | null>(null);
-  const { jobs, loading, error, refetch, updateJob, hasJob } = useJobs();
+  const { jobs, loading, loadingMore, error, hasMore, refetch, loadMore, updateJob, hasJob } = useJobs();
   const { counts, refetchCounts } = useJobCounts();
 
   useWebSocket((msg: WSMessage) => {
@@ -91,6 +91,9 @@ export default function Dashboard() {
                 jobs={jobs}
                 filterStatus={activeTab as JobStatus | 'all'}
                 onCancel={(id) => void handleCancel(id)}
+                hasMore={hasMore}
+                loadingMore={loadingMore}
+                onLoadMore={loadMore}
               />
             )}
           </div>

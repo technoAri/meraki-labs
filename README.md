@@ -16,7 +16,7 @@ The stack takes ~30 seconds to fully start. PostgreSQL runs migrations automatic
 | Service | URL | Credentials |
 |---|---|---|
 | Dashboard | http://localhost | — |
-| REST API | http://localhost/v1 | `x-api-key: test-api-key-1234` |
+| REST API | http://localhost/v1 | `x-api-key: test-e2e-key-5678` (300/min) |
 | Prometheus | http://localhost:9091 | — |
 | Jaeger (traces) | http://localhost:16687 | — |
 
@@ -98,12 +98,18 @@ pnpm --filter @task-queue/e2e test
 
 ### Authentication
 
-Every API request requires:
-```
-x-api-key: test-api-key-1234
-```
+Every API request requires an `x-api-key` header. Two tenants are pre-seeded:
 
-The seeded test tenant has a **60 req/min** rate limit and **5 max concurrent jobs**.
+| Key | Rate limit | Concurrency | When to use |
+|---|---|---|---|
+| `test-api-key-1234` | 60/min | 5 jobs | Rate-limit testing only |
+| `test-e2e-key-5678` | 300/min | 20 jobs | Everything else — exploration, DLQ tests, dashboard |
+
+A **tenant** is an API client identified by its key — each tenant has its own isolated job namespace, rate limit, and concurrency quota. The dashboard is pre-configured with `test-e2e-key-5678`.
+
+```
+x-api-key: test-e2e-key-5678
+```
 
 ---
 
@@ -137,11 +143,18 @@ Submit `{"fail": true}` in the payload to simulate a failing job (useful for DLQ
 ### Job Queries
 
 ```bash
-# Get all jobs (newest first, limit 100)
+# List jobs — newest first, 50 per page
 curl http://localhost/v1/jobs -H "x-api-key: test-api-key-1234"
+# → {"data": [...], "nextCursor": "<token>|null"}
+
+# Next page — pass the cursor from the previous response
+curl "http://localhost/v1/jobs?cursor=<token>" -H "x-api-key: test-api-key-1234"
 
 # Filter by status: pending | running | completed | failed | dead_letter
 curl "http://localhost/v1/jobs?status=pending" -H "x-api-key: test-api-key-1234"
+
+# Custom page size (max 200)
+curl "http://localhost/v1/jobs?limit=20" -H "x-api-key: test-api-key-1234"
 
 # Get a specific job
 curl http://localhost/v1/jobs/<id> -H "x-api-key: test-api-key-1234"
@@ -150,6 +163,8 @@ curl http://localhost/v1/jobs/<id> -H "x-api-key: test-api-key-1234"
 curl http://localhost/v1/jobs/counts -H "x-api-key: test-api-key-1234"
 # → {"pending":3,"running":1,"completed":47,"failed":2,"dead_letter":1}
 ```
+
+Pagination uses a **cursor**, not an offset. The cursor encodes the position of the last item on the current page — new jobs inserted between requests never cause duplicates or skipped rows.
 
 ---
 
@@ -167,8 +182,12 @@ Only works on `pending` jobs. Sets status to `failed` with error `"Cancelled by 
 ### Dead Letter Queue
 
 ```bash
-# List jobs that exhausted all retry attempts
+# List dead-lettered jobs — 50 per page, newest first
 curl http://localhost/v1/dlq -H "x-api-key: test-api-key-1234"
+# → {"data": [...], "nextCursor": "<token>|null"}
+
+# Next page
+curl "http://localhost/v1/dlq?cursor=<token>" -H "x-api-key: test-api-key-1234"
 
 # Re-queue a dead-lettered job (resets attempts to 0, strips simulation flags from payload)
 curl -X POST http://localhost/v1/dlq/<id>/retry \
@@ -205,6 +224,8 @@ HTTP 429 Too Many Requests
 ```
 
 `retryAfter` is seconds until the window has capacity again. Rejected requests do **not** consume a slot in the window — only accepted requests count against the limit.
+
+**Burst behavior:** If you send all 60 allowed requests within one second, every slot expires at approximately the same time (~60 seconds later). You'll see a near-full-window wait before requests are accepted again. This is correct sliding window behavior, not a bug — spread requests over time to avoid it.
 
 ---
 
@@ -822,7 +843,7 @@ curl -s -X POST http://localhost/v1/jobs \
 
 # Verify it stays pending indefinitely (scheduled_at is in 2099)
 curl -s "http://localhost/v1/jobs?status=pending" \
-  -H "x-api-key: test-e2e-key-5678" | jq '.[0] | {id, status, scheduled_at}'
+  -H "x-api-key: test-e2e-key-5678" | jq '.data[0] | {id, status, scheduled_at}'
 ```
 
 ---
@@ -1129,3 +1150,17 @@ The natural evolution path if team or scale demands it:
 ### 12. DLQ strategy
 
 `dead_letter` is a status value in the same `jobs` table — simple and avoids an extra schema object. In production you'd move dead-lettered rows to a separate table (or a message topic like Kafka) to prevent the `idx_jobs_claim` partial index from bloating with rows that are never eligible for claiming.
+
+### 13. Cursor-based pagination instead of offset
+
+`GET /jobs` and `GET /dlq` use cursor-based pagination rather than `LIMIT N OFFSET M`. The cursor encodes the `(created_at, id)` tuple of the last row on the current page as a base64url JSON string. The next page query is:
+
+```sql
+WHERE (created_at, id) < ($cursor_ts, $cursor_id)
+ORDER BY created_at DESC, id DESC
+LIMIT $page_size + 1   -- fetch one extra to detect hasMore without COUNT
+```
+
+**Why not offset?** Jobs are inserted continuously. With offset pagination, a new job submitted between page 1 and page 2 shifts all rows down by one — the first row of page 2 would be a duplicate of the last row of page 1. Cursor pagination is immune to concurrent inserts because it uses a stable absolute position, not a relative row count.
+
+**The +1 trick:** Fetching `limit + 1` rows lets us detect whether a next page exists without issuing a separate `COUNT(*)` query, which would require a full index scan.

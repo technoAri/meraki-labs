@@ -7,12 +7,35 @@ import { invalidateCounts } from '../cache/countsCache.js';
 
 export async function dlqRoutes(app: FastifyInstance): Promise<void> {
   app.get('/dlq', async (request) => {
-    return readWithFallback((db) => db<Job[]>`
-      SELECT * FROM jobs
-      WHERE tenant_id = ${request.tenant.id} AND status = 'dead_letter'
-      ORDER BY updated_at DESC
-      LIMIT 100
-    `);
+    const query = request.query as { cursor?: string; limit?: string };
+    const pageSize = Math.min(query.limit ? parseInt(query.limit, 10) : 50, 200);
+
+    let decoded: { ts: string; id: string } | null = null;
+    if (query.cursor) {
+      try {
+        decoded = JSON.parse(Buffer.from(query.cursor, 'base64url').toString()) as { ts: string; id: string };
+      } catch { /* invalid cursor — treat as first page */ }
+    }
+
+    const rows = await readWithFallback((db) => {
+      const cursorFilter = decoded
+        ? db`AND (updated_at < ${decoded.ts}::timestamptz OR (updated_at = ${decoded.ts}::timestamptz AND id::text < ${decoded.id}))`
+        : db``;
+      return db<Job[]>`
+        SELECT * FROM jobs
+        WHERE tenant_id = ${request.tenant.id} AND status = 'dead_letter'
+        ${cursorFilter}
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ${pageSize + 1}
+      `;
+    });
+
+    const hasMore = rows.length > pageSize;
+    const data = hasMore ? rows.slice(0, pageSize) : rows;
+    const nextCursor = hasMore
+      ? Buffer.from(JSON.stringify({ ts: data[data.length - 1].updated_at, id: data[data.length - 1].id })).toString('base64url')
+      : null;
+    return { data, nextCursor };
   });
 
   app.post<{ Params: { id: string } }>('/dlq/:id/retry', async (request, reply) => {

@@ -65,7 +65,7 @@ test.describe('Job lifecycle — API', () => {
 
     // Verify it appears in DLQ list
     const dlq = await request.get(`${API}/dlq`, { headers: HEADERS });
-    const dlqJobs = await dlq.json() as { id: string }[];
+    const { data: dlqJobs } = await dlq.json() as { data: { id: string }[] };
     expect(dlqJobs.some((j) => j.id === job.id)).toBe(true);
   });
 
@@ -92,7 +92,7 @@ test.describe('Job lifecycle — API', () => {
 
     // Verify removed from DLQ list
     const dlq = await request.get(`${API}/dlq`, { headers: HEADERS });
-    const dlqJobs = await dlq.json() as { id: string }[];
+    const { data: dlqJobs } = await dlq.json() as { data: { id: string }[] };
     expect(dlqJobs.some((j) => j.id === job.id)).toBe(false);
   });
 

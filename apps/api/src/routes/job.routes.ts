@@ -33,16 +33,19 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get('/jobs', async (request, reply) => {
-    const query = request.query as { status?: string };
+    const query = request.query as { status?: string; cursor?: string; limit?: string };
     const validStatuses: JobStatus[] = ['pending', 'running', 'completed', 'failed', 'dead_letter'];
     const status = query.status as JobStatus | undefined;
+    const limit = query.limit ? parseInt(query.limit, 10) : undefined;
 
     if (status && !validStatuses.includes(status)) {
       return reply.code(400).send({ error: `status must be one of: ${validStatuses.join(', ')}` });
     }
+    if (limit !== undefined && (isNaN(limit) || limit < 1)) {
+      return reply.code(400).send({ error: 'limit must be a positive integer' });
+    }
 
-    const jobs = await listJobs(request.tenant.id, status);
-    return jobs;
+    return listJobs(request.tenant.id, status, query.cursor, limit);
   });
 
   app.get<{ Params: { id: string } }>('/jobs/:id', async (request, reply) => {
