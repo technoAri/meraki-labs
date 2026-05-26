@@ -4,12 +4,6 @@ const API = `${process.env.BASE_URL ?? 'http://localhost'}/v1`;
 const KEY = process.env.API_KEY ?? 'test-api-key-1234';
 const HEADERS = { 'x-api-key': KEY, 'Content-Type': 'application/json' };
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-async function submitJob(request: ReturnType<typeof test.info>['attachments'][0] extends never ? never : unknown, payload: object, extra: object = {}) {
-  // Use fetch directly inside tests via page.evaluate or request fixture
-}
-
 // ─── API-level helpers using Playwright request context ─────────────────────
 
 test.describe('Job lifecycle — API', () => {
@@ -31,7 +25,6 @@ test.describe('Job lifecycle — API', () => {
   });
 
   test('1. Submit a normal job and it completes', async ({ request }) => {
-    // Submit
     const res = await request.post(`${API}/jobs`, {
       headers: HEADERS,
       data: { payload: { task: 'e2e-normal' } },
@@ -139,15 +132,24 @@ test.describe('Job lifecycle — API', () => {
     expect(j1.id).toBe(j2.id);
   });
 
-  test('7. Rate limit returns 429 after limit exceeded', async ({ request }) => {
-    // Hit the endpoint rapidly to trigger rate limit
-    // Tenant limit is 60/min; send 80 to reliably exceed it even with prior-test requests in window
-    const requests = Array.from({ length: 80 }, () =>
-      request.get(`${API}/jobs`, { headers: HEADERS })
-    );
-    const responses = await Promise.all(requests);
-    const statuses = responses.map((r) => r.status());
-    expect(statuses.some((s) => s === 429)).toBe(true);
+});
+
+// ─── Infrastructure ──────────────────────────────────────────────────────────
+
+test.describe('Infrastructure', () => {
+
+  test('7. GET /health returns ok', async ({ request }) => {
+    const res = await request.get('http://localhost/health');
+    expect(res.status()).toBe(200);
+    const body = await res.json() as { status: string };
+    expect(body.status).toBe('ok');
+  });
+
+  test('8. Invalid API key returns 401', async ({ request }) => {
+    const res = await request.get(`${API}/jobs`, {
+      headers: { 'x-api-key': 'not-a-real-key', 'Content-Type': 'application/json' },
+    });
+    expect(res.status()).toBe(401);
   });
 
 });
@@ -156,7 +158,7 @@ test.describe('Job lifecycle — API', () => {
 
 test.describe('Dashboard UI', () => {
 
-  test('8. Dashboard loads and shows MetricsBar', async ({ page }) => {
+  test('9. Dashboard loads and shows MetricsBar', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByText('Task Queue')).toBeVisible();
     await expect(page.getByText('Pending', { exact: true }).first()).toBeVisible();
@@ -164,24 +166,105 @@ test.describe('Dashboard UI', () => {
     await expect(page.getByText('Completed', { exact: true }).first()).toBeVisible();
   });
 
-  test('9. Submit job via form and see it in table', async ({ page }) => {
+  test('10. Submit job via form and see it in table', async ({ page }) => {
     await page.goto('/');
 
-    // Fill in the form
-    await page.locator('textarea').fill('{"task": "e2e-ui-test"}');
+    // Use a timestamp-scoped task name to avoid collisions across test runs
+    const taskName = `e2e-ui-${Date.now()}`;
+    await page.locator('textarea').fill(`{"task": "${taskName}"}`);
     await page.getByRole('button', { name: 'Submit Job' }).click();
 
-    // Row appears in table
-    await expect(page.getByText('e2e-ui-test')).toBeVisible({ timeout: 10_000 });
+    // Row appears in the table (scope to td to avoid matching the textarea itself)
+    await expect(page.locator('td').filter({ hasText: taskName }).first()).toBeVisible({ timeout: 10_000 });
   });
 
-  test('10. DLQ page loads and retry button is visible', async ({ page }) => {
+  test('11. DLQ page loads and retry button is visible', async ({ page }) => {
     // Navigate from root via React Router link (full-page goto /dlq hits the API via nginx)
     await page.goto('/');
     await expect(page.getByText('Task Queue')).toBeVisible();
     await page.getByRole('link', { name: 'Dead Letter Queue' }).click();
     await expect(page.getByRole('heading', { name: 'Dead Letter Queue' })).toBeVisible({ timeout: 8_000 });
     await expect(page.getByText('← Back to Dashboard')).toBeVisible();
+  });
+
+  test('12. DLQ retry — job disappears and stays gone (retry strips fail flag, job completes)', async ({ page, request }) => {
+    // Create a fail:true job that will dead-letter after exactly one attempt
+    const createRes = await request.post(`${API}/jobs`, {
+      headers: HEADERS,
+      data: { payload: { fail: true }, max_attempts: 1 },
+    });
+    expect(createRes.status()).toBe(201);
+    const job = await createRes.json() as { id: string };
+
+    // Wait for it to land in dead_letter
+    await expect.poll(async () => {
+      const r = await request.get(`${API}/jobs/${job.id}`, { headers: HEADERS });
+      return (await r.json() as { status: string }).status;
+    }, { timeout: 20_000, intervals: [500] }).toBe('dead_letter');
+
+    // Navigate to DLQ via client-side routing (direct page.goto('/dlq') bypasses React Router)
+    await page.goto('/');
+    await expect(page.getByText('Task Queue')).toBeVisible();
+    await page.getByRole('link', { name: 'Dead Letter Queue' }).click();
+    await expect(page.getByRole('heading', { name: 'Dead Letter Queue' })).toBeVisible({ timeout: 8_000 });
+
+    // Target the specific row by UUID prefix — first 8 chars are visible in the truncated display
+    const idPrefix = job.id.slice(0, 8);
+    const jobRow = page.locator('tbody tr').filter({ hasText: idPrefix });
+    await expect(jobRow).toBeVisible({ timeout: 5_000 });
+
+    // Click Retry — the row must vanish WITHOUT page.reload() (driven by WebSocket 'pending' event)
+    await jobRow.getByRole('button', { name: 'Retry' }).click();
+    await expect(jobRow).not.toBeVisible({ timeout: 5_000 });
+
+    // The retry strips 'fail' from the payload via `payload - 'fail'` in the UPDATE.
+    // The worker succeeds and moves the job to 'completed' — it must NOT reappear in the DLQ.
+    await expect.poll(async () => {
+      const r = await request.get(`${API}/jobs/${job.id}`, { headers: HEADERS });
+      return (await r.json() as { status: string }).status;
+    }, { timeout: 15_000, intervals: [500] }).toBe('completed');
+
+    // Confirm the row stays absent from the DLQ table
+    await expect(page.locator('tbody tr').filter({ hasText: idPrefix })).not.toBeVisible();
+  });
+
+  test('13. WebSocket delivers real-time update without page refresh', async ({ page, request }) => {
+    // Wait for the WS connection to be created during page load, then confirm it's open
+    // before we submit — otherwise the JOB_UPDATE event may fire before the listener is ready.
+    const wsPromise = page.waitForEvent('websocket');
+    await page.goto('/');
+    const ws = await wsPromise;
+    await ws.waitForEvent('framereceived', { timeout: 5_000 }).catch(() => {});
+    await expect(page.getByText('Task Queue')).toBeVisible();
+
+    // Submit via API (not the form) — the only path for the row to appear is
+    // the WS JOB_UPDATE event triggering a refetch in Dashboard.tsx.
+    const taskId = `e2e-ws-${Date.now()}`;
+    const res = await request.post(`${API}/jobs`, {
+      headers: HEADERS,
+      data: { payload: { task: taskId } },
+    });
+    expect(res.status()).toBe(201);
+
+    // Dashboard must show the job without page.reload()
+    await expect(page.getByText(taskId)).toBeVisible({ timeout: 10_000 });
+  });
+
+});
+
+// ─── Rate limit — runs last to avoid polluting the 60s window for other tests ─
+
+test.describe('Rate limiting', () => {
+
+  test('13. Rate limit returns 429 after limit exceeded', async ({ request }) => {
+    // Tenant limit is 60/min; send 80 to reliably exceed it even accounting for
+    // requests already made in earlier tests within the same 60s window.
+    const requests = Array.from({ length: 80 }, () =>
+      request.get(`${API}/jobs`, { headers: HEADERS })
+    );
+    const responses = await Promise.all(requests);
+    const statuses = responses.map((r) => r.status());
+    expect(statuses.some((s) => s === 429)).toBe(true);
   });
 
 });

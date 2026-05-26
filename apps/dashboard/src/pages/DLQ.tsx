@@ -5,12 +5,12 @@ import { useWebSocket } from '../hooks/useWebSocket.js';
 import { DLQPanel } from '../components/DLQPanel.js';
 
 export default function DLQ() {
-  const { jobs, loading, error, refetch, updateJob, removeJob } = useJobs('dead_letter');
+  const { jobs, loading, error, refetch, removeJob } = useJobs('dead_letter');
 
   useWebSocket((msg: WSMessage) => {
     if (msg.type === 'JOB_UPDATE') {
       if (msg.data.status === 'dead_letter') {
-        updateJob({ id: msg.data.id, status: msg.data.status, updated_at: msg.data.updated_at });
+        void refetch();
       } else {
         removeJob(msg.data.id);
       }

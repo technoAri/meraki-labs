@@ -25,7 +25,8 @@ export async function dlqRoutes(app: FastifyInstance): Promise<void> {
         lease_expires_at = NULL,
         worker_id        = NULL,
         scheduled_at     = NOW(),
-        updated_at       = NOW()
+        updated_at       = NOW(),
+        payload          = payload - 'fail'
       WHERE id = ${request.params.id}
         AND tenant_id = ${request.tenant.id}
         AND status = 'dead_letter'

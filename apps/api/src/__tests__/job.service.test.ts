@@ -12,7 +12,7 @@ vi.mock('../db/client.js', () => ({
 vi.mock('../cache/countsCache.js', () => ({ invalidateCounts: vi.fn() }));
 vi.mock('../metrics/prometheus.js', () => ({
   jobsSubmittedTotal: { inc: vi.fn() },
-  jobsPendingGauge: { inc: vi.fn() },
+  jobsPendingGauge: { inc: vi.fn(), dec: vi.fn() },
 }));
 vi.mock('../ws/websocket.js', () => ({ broadcast: vi.fn() }));
 vi.mock('@opentelemetry/api', () => ({
@@ -67,5 +67,29 @@ describe('job.service idempotency', () => {
 
     expect(result.id).toBe('job-1');
     expect(mockSql).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('job.service cancelJob', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('returns null when job is not in pending state', async () => {
+    mockSql.mockResolvedValueOnce([]); // UPDATE WHERE status='pending' matches nothing
+
+    const { cancelJob } = await import('../services/job.service.js');
+    const result = await cancelJob('job-running', 'tenant-1');
+
+    expect(result).toBeNull();
+  });
+
+  it('returns updated job with failed status when cancelled from pending', async () => {
+    const cancelled = { ...baseJob, status: 'failed' as const, error: 'Cancelled by user' };
+    mockSql.mockResolvedValueOnce([cancelled]);
+
+    const { cancelJob } = await import('../services/job.service.js');
+    const result = await cancelJob('job-1', 'tenant-1');
+
+    expect(result?.status).toBe('failed');
+    expect(result?.error).toBe('Cancelled by user');
   });
 });
